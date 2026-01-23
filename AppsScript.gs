@@ -36,7 +36,7 @@ function runPlanner() {
 
     // Separate recent and upcoming events in memory
     const events = allEvents.filter((e) => new Date(e.start.dateTime) > now);
-
+    
     // Pre-geocode home only when env_var changes
     if (homeAddress !== lastHomeAddress) {
         props.setProperty(
@@ -62,7 +62,6 @@ function runPlanner() {
             continue;
         if (!ev.start || !ev.start.dateTime) continue; // skip all-day
         if (!ev.location) continue; // nowhere to route to
-
         const destLL = geocodeOrThrow_(ev.location);
 
         const plan = transitPlanArriveBy_(apiKey, homeLL, destLL, eventStart);
@@ -79,7 +78,6 @@ function runPlanner() {
 
 function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     const timeUntilEvent = eventStart.getTime() - now.getTime();
-
     const thresholdStart = new Date(
         eventStart.getTime() - minsToMs(need_transit_threshold_minutes),
     );
@@ -87,7 +85,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
         const eStart = new Date(e.start.dateTime);
         return eStart > thresholdStart && eStart < eventStart;
     });
-    // Check if there are events on sourceCalendar in the past need_transit_threshold_minutes (already on campus)
+    // Check if there are events on sourceCalendar in the past need_transit_threshold_minutes
     if (recentEvents.length > 0) {
         return false; // Skip if there are recent events -- already on campus
     }
@@ -98,11 +96,12 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     }
 
     // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
-    const targetThresholdStart = new Date(now.getTime() - minsToMs(60));
+    // * from the event start time
+    const targetThresholdStart = new Date(eventStart.getTime() - minsToMs(60));
     const recentTargetEvents =
         Calendar.Events.list(targetCalendar, {
             timeMin: targetThresholdStart.toISOString(),
-            timeMax: now.toISOString(),
+            timeMax: eventStart.toISOString(),
             singleEvents: true,
             maxResults: 250,
         }).items || [];
@@ -210,7 +209,7 @@ function upsertCommuteEvent_(calId, parentEv, depart, arrive, busNumber) {
     if (existing.length) {
         Calendar.Events.patch(body, calId, existing[0].id);
     } else {
-        console.log("creating");
+        console.log("creating: ", summary);
         Calendar.Events.insert(body, calId);
     }
 }
