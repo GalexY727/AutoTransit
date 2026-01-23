@@ -19,6 +19,8 @@ function runPlanner() {
         throw new Error("Missing TRANSIT_API_KEY or HOME_ADDRESS");
 
     const now = new Date();
+    // NOTE: 18/20 schedule goes only 47 days into the future
+    // So max horizon is now.getTime() + (24 * 60 * 60 * 1000 * 47)
     const horizon = new Date(now.getTime() + 24 * 60 * 60 * 1000); // next 24h
     const thresholdStart = new Date(
         now.getTime() - minsToMs(need_transit_threshold_minutes),
@@ -73,6 +75,7 @@ function runPlanner() {
         const busNumber = getBusNumber_(itinerary);
         // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
         upsertCommuteEvent_(targetCalendar, ev, depart, arrive, busNumber);
+        Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
     }
 }
 
@@ -84,11 +87,11 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     const recentEvents = allEvents.filter((e) => {
         const eStart = new Date(e.start.dateTime);
         const eEnd = new Date(e.end.dateTime);
-        return eStart > thresholdStart && eStart < eventStart || eEnd > thresholdStart; 
-        // we don't care if eEnd < eventStart or not, the > is sufficient
-        // EndTime is evaluated in case an event ended at the 'top' of the window.
+        return ((eStart > thresholdStart || eEnd > thresholdStart) && eStart < eventStart); 
+        // eEnd is evaluated in case an event ended at the 'top' of the window.
+        // we don't care if eEnd < eventStart or not
     });
-    
+
     // Check if there are events on sourceCalendar in the past need_transit_threshold_minutes
     if (recentEvents.length > 0) {
         return false; // Skip if there are recent events -- already on campus
