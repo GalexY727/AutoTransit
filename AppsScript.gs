@@ -83,15 +83,19 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     );
     const recentEvents = allEvents.filter((e) => {
         const eStart = new Date(e.start.dateTime);
-        return eStart > thresholdStart && eStart < eventStart;
+        const eEnd = new Date(e.end.dateTime);
+        return eStart > thresholdStart && eStart < eventStart || eEnd > thresholdStart; 
+        // we don't care if eEnd < eventStart or not, the > is sufficient
+        // EndTime is evaluated in case an event ended at the 'top' of the window.
     });
+    
     // Check if there are events on sourceCalendar in the past need_transit_threshold_minutes
     if (recentEvents.length > 0) {
         return false; // Skip if there are recent events -- already on campus
     }
 
     // Check if event is within 30 minutes -- 'realtime' updating
-    if (timeUntilEvent <= minsToMs(30)) {
+    if (timeUntilEvent <= minsToMs(30) && timeUntilEvent > 0) {
         return true;
     }
 
@@ -207,6 +211,7 @@ function upsertCommuteEvent_(calId, parentEv, depart, arrive, busNumber) {
     };
 
     if (existing.length) {
+      console.log("updating: ", summary);
         Calendar.Events.patch(body, calId, existing[0].id);
     } else {
         console.log("creating: ", summary);
