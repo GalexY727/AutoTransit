@@ -1,5 +1,7 @@
-const need_transit_threshold_minutes = 90;
+const NEED_TRANSIT_THRESHOLD_MINS = 90;
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
+const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+
 
 function runPlanner() {
     const props = PropertiesService.getScriptProperties();
@@ -23,7 +25,7 @@ function runPlanner() {
     // So max horizon is now.getTime() + (24 * 60 * 60 * 1000 * 47)
     const horizon = new Date(now.getTime() + 24 * 60 * 60 * 1000); // next 24h
     const thresholdStart = new Date(
-        now.getTime() - minsToMs(need_transit_threshold_minutes),
+        now.getTime() - minsToMs(NEED_TRANSIT_THRESHOLD_MINS),
     );
 
     // Pull events from threshold to horizon in one call
@@ -70,11 +72,8 @@ function runPlanner() {
         const itinerary = pickBestItinerary_(plan, eventStart);
         if (!itinerary) continue;
 
-        const depart = new Date(itinerary.start_time * 1000);
-        const arrive = new Date(itinerary.end_time * 1000);
-        const busNumber = getBusNumber_(itinerary);
         // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
-        upsertCommuteEvent_(targetCalendar, ev, depart, arrive, busNumber);
+        upsertCommuteEvent_(targetCalendar, ev, itinerary, now);
         Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
     }
 }
@@ -82,7 +81,7 @@ function runPlanner() {
 function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     const timeUntilEvent = eventStart.getTime() - now.getTime();
     const thresholdStart = new Date(
-        eventStart.getTime() - minsToMs(need_transit_threshold_minutes),
+        eventStart.getTime() - minsToMs(NEED_TRANSIT_THRESHOLD_MINS),
     );
     const recentEvents = allEvents.filter((e) => {
         const eStart = new Date(e.start.dateTime);
@@ -98,7 +97,9 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     }
 
     // Check if event is within 60 minutes -- 'realtime' updating
-    if (timeUntilEvent <= minsToMs(60) && timeUntilEvent > 0) {
+    // The second clause is to force the event to double check for late arrivals
+    // and to reset event name to no longer include relative timestamp in summary
+    if (timeUntilEvent <= minsToMs(60) && timeUntilEvent > -minsToMs(5)) {
         return true;
     }
 
@@ -187,13 +188,67 @@ function getBusNumber_(itinerary) {
     return null;
 }
 
-function upsertCommuteEvent_(calId, parentEv, depart, arrive, busNumber) {
+function getRelevantBusTimes_(itinerary) {
+    const legs = itinerary?.legs || [];
+    for (const leg of legs) {
+        if (leg.leg_mode !== "transit") continue;
+        const departureTime = leg?.start_time;
+        if (!departureTime) continue;
+        const arrival_time = leg.end_time;
+        return [new Date(departureTime * 1000), new Date(arrival_time * 1000)];
+    }
+    return null;
+}
+
+function getRelevantBusStops_(itinerary) {
+    const legs = itinerary?.legs || [];
+    const stops = []; // strings
+    for (const leg of legs) {
+        if (leg.leg_mode !== "transit") continue;
+        const itinerary = leg?.routes[0]?.itineraries[0];
+        if (!itinerary) continue;
+        const plan_details = itinerary?.plan_details;
+        if (!plan_details) continue;
+        
+        const start = plan_details.start_stop_offset;
+        const end = plan_details.end_stop_offset;
+
+        stops.push(itinerary.stops[start].stop_name)
+        stops.push(itinerary.stops[end].stop_name)
+        return stops;
+    }
+    return null;
+}
+
+// Example outputs: in 5 minutes, in 2 hours, tomorrow
+function getRelativeTime_(futureDate) {
+    const diffMs = futureDate - new Date();
+
+    const minutes = Math.round(diffMs / 60000);
+    if (minutes < 60) return rtf.format(minutes, 'minute');
+
+    const hours = Math.round(diffMs / 3600000);
+    if (hours < 24) return rtf.format(hours, 'hour');
+
+    const days = Math.round(diffMs / 86400000);
+    return rtf.format(days, 'day');
+}
+
+function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
+    const goTime = new Date(itinerary.start_time * 1000);
+    const arrivalTime = new Date(itinerary.end_time * 1000);
+    const busNumber = getBusNumber_(itinerary);
+    const relevantBusTimes = getRelevantBusTimes_(itinerary);
+    const relevantBusStops = getRelevantBusStops_(itinerary);
+    const relativeLeaveTime = getRelativeTime_(goTime);
+    const within15Minutes = (Math.round(goTime - now / 60000)) < 15;
+
     const parentId = parentEv.id;
     const marker = COMMUTE_TAG_PREFIX + parentId;
 
     // Find existing commute event in a small window
-    const searchMin = new Date(depart.getTime() - 6 * 60 * 60 * 1000);
-    const searchMax = new Date(arrive.getTime() + 6 * 60 * 60 * 1000);
+    const searchMin = new Date(goTime.getTime() - 6 * 60 * 60 * 1000);
+    const searchMax = new Date(arrivalTime.getTime() + 6 * 60 * 60 * 1000);
 
     const existing =
         Calendar.Events.list(calId, {
@@ -204,13 +259,23 @@ function upsertCommuteEvent_(calId, parentEv, depart, arrive, busNumber) {
             maxResults: 10,
         }).items || [];
 
-    const summary = `🚍 ${busNumber || "Bus"} to: ${parentEv.summary || "(untitled)"}`;
+    const summary = `🚍 ${busNumber || "Bus"} ${ within15Minutes ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
     const body = {
         summary,
-        description:
-            `Auto-generated by AutoTransit for:\n${parentEv.summary || "Name"} at ${parentEv.location || "Location"}\n\n${marker}`.trim(),
-        start: { dateTime: depart.toISOString() },
-        end: { dateTime: arrive.toISOString() },
+        description: dedent_
+                `
+                Bus ${ ((goTime - now > 0) ? "leaves " : "left ") + relativeLeaveTime } at ${ toRelativeTime_(relevantBusTimes[0]) }
+                 ➟ Last updated at ${ toRelativeTime_(now) }
+                 
+                Get on at:   ${ (relevantBusStops[0] || parentEv.summary || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[0]) }
+                Get off at:   ${ (relevantBusStops[1] || parentEv.summary || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[1])}
+
+                Auto-generated by AutoTransit for:
+                ${parentEv.summary || "Event Name"} @ ${formatLocation(parentEv.location) || "Location"}
+                
+                ${marker}`.trim(),
+        start: { dateTime: goTime.toISOString() },
+        end: { dateTime: arrivalTime.toISOString() },
     };
 
     if (existing.length) {
@@ -222,22 +287,6 @@ function upsertCommuteEvent_(calId, parentEv, depart, arrive, busNumber) {
     }
 }
 
-function otpDateTime_(d) {
-    // OTP commonly accepts date=YYYY-MM-DD and time=HH:MMam/pm
-    const pad = (n) => (n < 10 ? "0" + n : "" + n);
-    const yyyy = d.getFullYear();
-    const mm = pad(d.getMonth() + 1);
-    const dd = pad(d.getDate());
-
-    let h = d.getHours();
-    const m = pad(d.getMinutes());
-    const ampm = h >= 12 ? "pm" : "am";
-    h = h % 12;
-    if (h === 0) h = 12;
-
-    return { dateStr: `${yyyy}-${mm}-${dd}`, timeStr: `${h}:${m}${ampm}` };
-}
-
 function toQuery_(obj) {
     return Object.keys(obj)
         .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(obj[k]))
@@ -246,4 +295,21 @@ function toQuery_(obj) {
 
 function minsToMs(mins) {
     return mins * 60 * 1000;
+}
+
+function dedent_(strings, ...values) {
+  let raw = strings.reduce((acc, s, i) => acc + s + (values[i] ?? ""), "");
+  raw = raw.replace(/^\n/, "").replace(/\n[ \t]+/g, "\n");
+  return raw.trim();
+}
+
+function toRelativeTime_(date) {
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function formatLocation(location) {
+  if (!location) return '';
+
+  const parts = location.split(',').map(p => p.trim());
+  return parts.slice(0, 2).join(', ');
 }
