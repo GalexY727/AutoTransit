@@ -97,8 +97,8 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
         return false; // Skip if there are recent events -- already on campus
     }
 
-    // Check if event is within 30 minutes -- 'realtime' updating
-    if (timeUntilEvent <= minsToMs(30) && timeUntilEvent > 0) {
+    // Check if event is within 60 minutes -- 'realtime' updating
+    if (timeUntilEvent <= minsToMs(60) && timeUntilEvent > 0) {
         return true;
     }
 
