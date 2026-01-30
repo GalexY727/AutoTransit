@@ -247,7 +247,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
     const relevantBusTimes = getRelevantBusTimes_(itinerary);
     const relevantBusStops = getRelevantBusStops_(itinerary);
     const relativeLeaveTime = getRelativeTime_(goTime);
-    const within15Minutes = (Math.round(goTime - now / 60000)) < 15;
+    const within15Minutes = (Math.round((goTime - now) / 60000)) < 15;
 
     const parentId = parentEv.id;
     const marker = COMMUTE_TAG_PREFIX + parentId;
