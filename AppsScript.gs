@@ -79,7 +79,7 @@ function runPlanner() {
 }
 
 function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
-    const timeUntilEvent = eventStart.getTime() - now.getTime();
+    const realtime_threshold = 25;
     const thresholdStart = new Date(
         eventStart.getTime() - minsToMs_(NEED_TRANSIT_THRESHOLD_MINS),
     );
@@ -96,15 +96,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
         return false; // Skip if there are recent events -- already on campus
     }
 
-    // Check if event is within 60 minutes -- 'realtime' updating
-    // The second clause is to force the event to double check for late arrivals
-    // and to reset event name to no longer include relative timestamp in summary
-    if (timeUntilEvent <= minsToMs_(60) && timeUntilEvent > -minsToMs_(5)) {
-        return true;
-    }
-
-    // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
-    // * from the event start time
+    // Entries in targetCalendar (AutoTransit) in the past 60 minutes from event start time
     const targetThresholdStart = new Date(eventStart.getTime() - minsToMs_(60));
     const recentTargetEvents =
         Calendar.Events.list(targetCalendar, {
@@ -114,6 +106,20 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
             maxResults: 250,
         }).items || [];
 
+    if (recentTargetEvents.length !== 0) {
+        // We have an AutoTransit entry: does it need updating?
+        const autoTransitEntry = recentTargetEvents[0];
+        const timeUntilDepart = new Date(autoTransitEntry.start.dateTime).getTime() - now.getTime();
+        // Check if event is soon enough for realtime updating -- 'realtime' updating
+        // The second clause is to force the event to double check for late arrivals
+        // and to reset event name to no longer include relative timestamp in summary
+        if (timeUntilDepart <= minsToMs_(realtime_threshold) && timeUntilDepart > -5) {
+            return true;
+        }
+    }
+
+    // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
+    // * from the event start time
     return recentTargetEvents.length === 0; // Process if no recent target events
 }
 
