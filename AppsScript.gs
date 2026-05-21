@@ -61,20 +61,26 @@ function runPlanner() {
     }
 
     for (const ev of events) {
-        const eventStart = new Date(ev.start.dateTime);
-        if (!shouldProcess_(ev, allEvents, targetCalendar, now, eventStart))
-            continue;
-        if (!ev.start || !ev.start.dateTime) continue; // skip all-day
-        if (!ev.location) continue; // nowhere to route to
-        const destLL = geocodeOrThrow_(ev.location);
+        try {
+            const eventStart = new Date(ev.start.dateTime);
+            if (!shouldProcess_(ev, allEvents, targetCalendar, now, eventStart))
+                continue;
+            if (!ev.start || !ev.start.dateTime) continue; // skip all-day
+            if (!ev.location) continue; // nowhere to route to
+            const destLL = geocodeOrThrow_(ev.location);
 
-        const plan = transitPlanArriveBy_(apiKey, homeLL, destLL, eventStart);
-        const itinerary = pickBestItinerary_(plan, eventStart);
-        if (!itinerary) continue;
+            const plan = transitPlanArriveBy_(apiKey, homeLL, destLL, eventStart);
+            if (!plan) continue; // API call failed silently (e.g. rate-limit)
+            const itinerary = pickBestItinerary_(plan, eventStart);
+            if (!itinerary) continue;
 
-        // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
-        upsertCommuteEvent_(targetCalendar, ev, itinerary, now);
-        Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
+            // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
+            upsertCommuteEvent_(targetCalendar, ev, itinerary, now);
+            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
+        } catch (e) {
+            // Fail silently -- likely a rate-limit or transient API error
+            console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
+        }
     }
 }
 
@@ -144,31 +150,40 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
         to_lon: toLL.lon,
         arrival_time: arrival_time_ms,
         should_update_realtime: true,
-        consider_downtime: true,
+        consider_downtimes: true,
+        max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
     };
 
     const url =
-        "https://external.transitapp.com/v3/public/plan?" + toQuery_(qs);
-    const resp = UrlFetchApp.fetch(url, {
-        method: "get",
-        headers: { apiKey: apiKey },
-        muteHttpExceptions: true,
-    });
-    if (resp.getResponseCode() >= 300) {
-        throw new Error(
-            "Transit plan failed: " +
-                resp.getResponseCode() +
-                " " +
-                resp.getContentText(),
-        );
+        "https://external.transitapp.com/v4/public/plan?" + toQuery_(qs);
+    try {
+        const resp = UrlFetchApp.fetch(url, {
+            method: "get",
+            headers: { apiKey: apiKey },
+            muteHttpExceptions: true,
+        });
+        if (resp.getResponseCode() >= 300) {
+            // Fail silently (e.g. rate-limit); caller checks for null
+            console.log(
+                "Transit API returned " +
+                    resp.getResponseCode() +
+                    ": " +
+                    resp.getContentText(),
+            );
+            return null;
+        }
+        return JSON.parse(resp.getContentText());
+    } catch (e) {
+        console.log("Transit API fetch failed (silent): " + e.message);
+        return null;
     }
-    return JSON.parse(resp.getContentText());
 }
 
 // Pick the itinerary that arrives closest to 10 minutes before the event start
 function pickBestItinerary_(plan, eventStart) {
     const itineraries = plan?.results || [];
-    const idealTime = eventStart.setMinutes(eventStart.getMinutes() - 10);
+    // Compare in unix seconds to match the API's end_time field
+    const idealTime = Math.floor(eventStart.getTime() / 1000) - 10 * 60;
     let bestResult = itineraries[0];
 
     for (const result of itineraries.slice(1)) {
@@ -176,7 +191,7 @@ function pickBestItinerary_(plan, eventStart) {
         if (!time) continue;
 
         const diff = Math.abs(idealTime - time);
-        if (diff < Math.abs(idealTime - bestResult.endTime)) {
+        if (diff < Math.abs(idealTime - bestResult.end_time)) {
             bestResult = result;
         }
     }
@@ -226,6 +241,20 @@ function getRelevantBusStops_(itinerary) {
     return null;
 }
 
+// Returns the departure time of the *next* bus after the planned one.
+// Requires max_num_departures >= 2 in the API request (v4 departures array).
+function getNextDeparture_(itinerary) {
+    const legs = itinerary?.legs || [];
+    for (const leg of legs) {
+        if (leg.leg_mode !== "transit") continue;
+        const departures = leg?.departures || [];
+        // departures[0] is the planned trip; departures[1] is the following service
+        if (departures.length < 2) return null;
+        return new Date(departures[1].departure_time * 1000);
+    }
+    return null;
+}
+
 // Example outputs: in 5 minutes, in 2 hours, tomorrow
 function getRelativeTime_(futureDate) {
     const diffMs = futureDate - new Date();
@@ -247,7 +276,12 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
     const relevantBusTimes = getRelevantBusTimes_(itinerary);
     const relevantBusStops = getRelevantBusStops_(itinerary);
     const relativeLeaveTime = getRelativeTime_(goTime);
-    const within15Minutes = (Math.round((goTime - now) / 60000)) < 15;
+    const minsUntilDepart = Math.round((goTime - now) / 60000);
+    // Only show the countdown in the title while the departure is upcoming and close
+    const within15Minutes = minsUntilDepart >= 0 && minsUntilDepart < 15;
+    const busAlreadyLeft = goTime <= now;
+    // Surface the next available bus after the planned one has already departed
+    const nextDeparture = busAlreadyLeft ? getNextDeparture_(itinerary) : null;
 
     const parentId = parentEv.id;
     const marker = COMMUTE_TAG_PREFIX + parentId;
@@ -266,13 +300,21 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
         }).items || [];
 
     const summary = `🚍 ${busNumber || "Bus"} ${ within15Minutes ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
+
+    // After departure: "Bus left at 10:30 AM. Next departure is at 10:50 AM"
+    // Before departure: "Bus leaves in 5 minutes at 10:30 AM"
+    const busStatusLine = busAlreadyLeft
+        ? `Bus left at ${ toRelativeTime_(relevantBusTimes[0]) }` +
+          (nextDeparture ? `. Next departure is at ${ toRelativeTime_(nextDeparture) }` : "")
+        : `Bus leaves ${ relativeLeaveTime } at ${ toRelativeTime_(relevantBusTimes[0]) }`;
+
     const body = {
         summary,
         description: dedent_
                 `
-                Bus ${ ((goTime - now > 0) ? "leaves " : "left ") + relativeLeaveTime } at ${ toRelativeTime_(relevantBusTimes[0]) }
+                ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
-                 
+
                 Get on at:   ${ (relevantBusStops[0] || parentEv.summary || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[0]) }
                 Get off at:   ${ (relevantBusStops[1] || parentEv.summary || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[1])}
 
