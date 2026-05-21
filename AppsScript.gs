@@ -40,7 +40,7 @@ function runPlanner() {
         }).items || [];
 
     // Separate recent and upcoming events in memory
-    const events = allEvents.filter((e) => new Date(e.start.dateTime) > now);
+    const events = allEvents.filter((e) => isFutureTimedEvent_(e, now));
     
     // Pre-geocode home only when env_var changes
     if (homeAddress !== lastHomeAddress) {
@@ -63,10 +63,10 @@ function runPlanner() {
 
     for (const ev of events) {
         try {
+            if (!ev?.start?.dateTime) continue; // skip all-day or malformed events
             const eventStart = new Date(ev.start.dateTime);
             if (!shouldProcess_(ev, allEvents, targetCalendar, now, eventStart))
                 continue;
-            if (!ev.start || !ev.start.dateTime) continue; // skip all-day
             if (!ev.location) continue; // nowhere to route to
             const destLL = geocodeOrThrow_(ev.location);
 
@@ -91,6 +91,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
         eventStart.getTime() - minsToMs_(NEED_TRANSIT_THRESHOLD_MINS),
     );
     const recentEvents = allEvents.filter((e) => {
+        if (!e?.start?.dateTime || !e?.end?.dateTime) return false;
         const eStart = new Date(e.start.dateTime);
         const eEnd = new Date(e.end.dateTime);
         return ((eStart > thresholdStart || eEnd > thresholdStart) && eStart < eventStart); 
@@ -113,9 +114,11 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
             maxResults: 250,
         }).items || [];
 
-    if (recentTargetEvents.length !== 0) {
+    const timedRecentTargetEvents = sortTimedEventsByStart_(recentTargetEvents);
+
+    if (timedRecentTargetEvents.length !== 0) {
         // We have an AutoTransit entry: does it need updating?
-        const autoTransitEntry = recentTargetEvents[0];
+        const autoTransitEntry = timedRecentTargetEvents[0];
         const timeUntilDepart = new Date(autoTransitEntry.start.dateTime).getTime() - now.getTime();
         // Check if event is soon enough for realtime updating -- 'realtime' updating
         // The second clause is to force the event to double check for late arrivals
@@ -127,7 +130,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
 
     // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
     // * from the event start time
-    return recentTargetEvents.length === 0; // Process if no recent target events
+    return timedRecentTargetEvents.length === 0; // Process if no recent timed target events
 }
 
 // Uses Apps Script Maps service geocoder
@@ -182,18 +185,21 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
 
 // Pick the itinerary that arrives closest to 10 minutes before the event start
 function pickBestItinerary_(plan, eventStart) {
-    const itineraries = plan?.results || [];
+    const itineraries = (plan?.results || []).filter(result =>
+        typeof result?.start_time === 'number' &&
+        typeof result.end_time === 'number'
+    );
+    if (!itineraries.length) return null;
     // Compare in unix seconds to match the API's end_time field
     const idealTime = Math.floor(eventStart.getTime() / 1000) - 10 * 60;
     let bestResult = itineraries[0];
+    let bestDiff = Math.abs(idealTime - bestResult.end_time);
 
     for (const result of itineraries.slice(1)) {
-        const time = result?.end_time;
-        if (!time) continue;
-
-        const diff = Math.abs(idealTime - time);
-        if (diff < Math.abs(idealTime - bestResult.end_time)) {
+        const diff = Math.abs(idealTime - result.end_time);
+        if (diff < bestDiff) {
             bestResult = result;
+            bestDiff = diff;
         }
     }
     return bestResult || null;
@@ -209,7 +215,11 @@ function getBusNumber_(itinerary) {
 }
 
 function getTransitLegs_(itinerary) {
-    return (itinerary?.legs || []).filter(l => l.leg_mode === 'transit');
+    return (itinerary?.legs || []).filter(l =>
+        l?.leg_mode === 'transit' &&
+        typeof l.start_time === 'number' &&
+        typeof l.end_time === 'number'
+    );
 }
 
 function getTransferWaits_(transitLegs) {
@@ -265,6 +275,10 @@ function sortTimedEventsByStart_(events) {
     return events
         .filter(event => event?.start?.dateTime)
         .sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
+}
+
+function isFutureTimedEvent_(event, now) {
+    return !!event?.start?.dateTime && new Date(event.start.dateTime) > now;
 }
 
 function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSummary) {
@@ -439,6 +453,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
             singleEvents: true,
             maxResults: 10,
         }).items || [];
+    const timedExisting = sortTimedEventsByStart_(existing);
 
     const summary = `🚍 ${busNumber || "Bus"} ${ within15Minutes ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
 
@@ -479,18 +494,18 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
         end: { dateTime: arrivalTime.toISOString() },
     };
 
-    if (existing.length) {
+    if (timedExisting.length) {
         console.log("updating: ", summary);
-        Calendar.Events.patch(body, calId, existing[0].id);
+        Calendar.Events.patch(body, calId, timedExisting[0].id);
     } else {
         console.log("creating: ", summary);
         Calendar.Events.insert(body, calId);
     }
 
     // Delete extras from a prior split-event state (split → single/combined transition)
-    for (let i = 1; i < existing.length; i++) {
-        console.log("deleting extra commute event: ", existing[i].summary);
-        Calendar.Events.remove(calId, existing[i].id);
+    for (let i = 1; i < timedExisting.length; i++) {
+        console.log("deleting extra commute event: ", timedExisting[i].summary);
+        Calendar.Events.remove(calId, timedExisting[i].id);
     }
 }
 
