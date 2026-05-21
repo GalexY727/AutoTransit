@@ -199,14 +199,12 @@ function pickBestItinerary_(plan, eventStart) {
 }
 
 function getBusNumber_(itinerary) {
-    const legs = itinerary?.legs || [];
-    for (const leg of legs) {
-        if (leg.leg_mode !== "transit") continue;
-        const busNumber = leg?.routes[0]?.route_short_name;
-        if (!busNumber) continue;
-        return busNumber;
-    }
-    return null;
+    // For multi-leg trips, joins all route short names with " → " (e.g. "19 → 16").
+    // Single-leg output is unchanged.
+    const busNums = getTransitLegs_(itinerary)
+        .map(leg => leg?.routes?.[0]?.route_short_name)
+        .filter(Boolean);
+    return busNums.length ? busNums.join(' → ') : null;
 }
 
 function getTransitLegs_(itinerary) {
@@ -406,4 +404,22 @@ function test_getRelevantBusStops_() {
   const bad = { legs: [{ leg_mode: 'transit', routes: [{ itineraries: [{}] }] }] };
   console.assert(getRelevantBusStops_(bad)[0][0] === null, 'FAIL: missing pd should give null');
   console.log('[PASS] test_getRelevantBusStops_');
+}
+
+function test_getBusNumber_() {
+  const single = { legs: [
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', routes: [{ route_short_name: '19' }] },
+  ]};
+  const multi = { legs: [
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', routes: [{ route_short_name: '19' }] },
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', routes: [{ route_short_name: '16' }] },
+  ]};
+  const noRoute = { legs: [{ leg_mode: 'transit', routes: [{}] }] };
+  console.assert(getBusNumber_(single) === '19',      'FAIL: single-leg should return "19"');
+  console.assert(getBusNumber_(multi)  === '19 → 16', 'FAIL: multi-leg should return "19 → 16"');
+  console.assert(getBusNumber_(noRoute) === null,     'FAIL: missing route_short_name should return null');
+  console.log('[PASS] test_getBusNumber_');
 }
