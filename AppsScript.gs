@@ -211,6 +211,16 @@ function getTransitLegs_(itinerary) {
     return (itinerary?.legs || []).filter(l => l.leg_mode === 'transit');
 }
 
+function getTransferWaits_(transitLegs) {
+    // Returns an array of wait times in seconds between consecutive transit legs.
+    // Clamped to 0 to handle real-time anomalies where leg N+1 departs before leg N arrives.
+    const waits = [];
+    for (let i = 0; i < transitLegs.length - 1; i++) {
+        waits.push(Math.max(0, transitLegs[i + 1].start_time - transitLegs[i].end_time));
+    }
+    return waits;
+}
+
 function getRelevantBusTimes_(itinerary) {
     // Returns [[depart, arrive], ...] — one pair per transit leg in order
     return getTransitLegs_(itinerary).map(leg => [
@@ -422,4 +432,20 @@ function test_getBusNumber_() {
   console.assert(getBusNumber_(multi)  === '19 → 16', 'FAIL: multi-leg should return "19 → 16"');
   console.assert(getBusNumber_(noRoute) === null,     'FAIL: missing route_short_name should return null');
   console.log('[PASS] test_getBusNumber_');
+}
+
+function test_getTransferWaits_() {
+  const legs = [
+    { start_time: 1000, end_time: 2000 },
+    { start_time: 2360, end_time: 3000 },  // wait = 360s
+    { start_time: 3900, end_time: 4000 },  // wait = 900s
+  ];
+  const waits = getTransferWaits_(legs);
+  console.assert(waits.length === 2,   'FAIL: expected 2 waits for 3 legs');
+  console.assert(waits[0] === 360,     'FAIL: first wait should be 360s');
+  console.assert(waits[1] === 900,     'FAIL: second wait should be 900s');
+  const overlap = [{ start_time: 100, end_time: 200 }, { start_time: 180, end_time: 300 }];
+  console.assert(getTransferWaits_(overlap)[0] === 0, 'FAIL: negative gap should clamp to 0');
+  console.assert(getTransferWaits_([{ start_time: 1, end_time: 2 }]).length === 0, 'FAIL: single leg should have 0 waits');
+  console.log('[PASS] test_getTransferWaits_');
 }
