@@ -209,6 +209,10 @@ function getBusNumber_(itinerary) {
     return null;
 }
 
+function getTransitLegs_(itinerary) {
+    return (itinerary?.legs || []).filter(l => l.leg_mode === 'transit');
+}
+
 function getRelevantBusTimes_(itinerary) {
     const legs = itinerary?.legs || [];
     for (const leg of legs) {
@@ -360,4 +364,19 @@ function formatLocation_(location) {
 
   const parts = location.split(',').map(p => p.trim());
   return parts.slice(0, 2).join(', ');
+}
+
+function test_getTransitLegs_() {
+  const mock = { legs: [
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', routes: [{ route_short_name: '19' }] },
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', routes: [{ route_short_name: '16' }] },
+  ]};
+  const result = getTransitLegs_(mock);
+  console.assert(result.length === 2, 'FAIL: expected 2 transit legs, got ' + result.length);
+  console.assert(result[0].routes[0].route_short_name === '19', 'FAIL: first leg should be route 19');
+  console.assert(getTransitLegs_(null).length === 0, 'FAIL: null input should return []');
+  console.assert(getTransitLegs_({}).length === 0, 'FAIL: missing legs should return []');
+  console.log('[PASS] test_getTransitLegs_');
 }
