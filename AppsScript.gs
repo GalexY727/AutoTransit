@@ -243,18 +243,42 @@ function getRelevantBusStops_(itinerary) {
     });
 }
 
-// Returns the departure time of the *next* bus after the planned one.
-// Requires max_num_departures >= 2 in the API request (v4 departures array).
-function getNextDeparture_(itinerary) {
-    const legs = itinerary?.legs || [];
-    for (const leg of legs) {
-        if (leg.leg_mode !== "transit") continue;
-        const departures = leg?.departures || [];
-        // departures[0] is the planned trip; departures[1] is the following service
-        if (departures.length < 2) return null;
-        return new Date(departures[1].departure_time * 1000);
+function getNextDeparture_(itinerary, legIndex) {
+    // Returns the departure time of the *next* bus after the planned one for a given leg.
+    // legIndex defaults to 0 (first transit leg) for backward compatibility.
+    // Requires max_num_departures >= 2 in the API request (v4 departures array).
+    const legs = getTransitLegs_(itinerary);
+    const leg = legs[legIndex ?? 0];
+    if (!leg) return null;
+    const departures = leg?.departures || [];
+    // departures[0] is the planned trip; departures[1] is the following service
+    if (departures.length < 2) return null;
+    return new Date(departures[1].departure_time * 1000);
+}
+
+function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs) {
+    // Builds the per-leg "Get on / Get off" section for combined multi-leg descriptions.
+    // busTimes: [[dept, arrive], ...]   busStops: [[on, off], ...]
+    const waits = getTransferWaits_(transitLegs);
+    const lines = [];
+    for (let i = 0; i < transitLegs.length; i++) {
+        const routeNum = transitLegs[i]?.routes?.[0]?.route_short_name || 'Bus';
+        const [dept, arrive]    = busTimes[i];
+        const [onStop, offStop] = busStops[i] || [null, null];
+        const fallback = 'unknown stop | stay vigilant!';
+
+        lines.push(`Leg ${i + 1} — Route ${routeNum}`);
+        lines.push(`Get on at:   ${ (onStop  || fallback) + ' @ ' + toRelativeTime_(dept)   }`);
+        lines.push(`Get off at:  ${ (offStop || fallback) + ' @ ' + toRelativeTime_(arrive) }`);
+
+        if (i < waits.length) {
+            const waitMins = Math.round(waits[i] / 60);
+            lines.push('');
+            lines.push(`Transfer: ${waitMins} min wait`);
+            lines.push('');
+        }
     }
-    return null;
+    return lines.join('\n');
 }
 
 // Example outputs: in 5 minutes, in 2 hours, tomorrow
@@ -448,4 +472,41 @@ function test_getTransferWaits_() {
   console.assert(getTransferWaits_(overlap)[0] === 0, 'FAIL: negative gap should clamp to 0');
   console.assert(getTransferWaits_([{ start_time: 1, end_time: 2 }]).length === 0, 'FAIL: single leg should have 0 waits');
   console.log('[PASS] test_getTransferWaits_');
+}
+
+function test_getNextDeparture_() {
+  const mock = { legs: [
+    { leg_mode: 'walk' },
+    { leg_mode: 'transit', departures: [{ departure_time: 1000 }, { departure_time: 2000 }] },
+    { leg_mode: 'transit', departures: [{ departure_time: 3000 }, { departure_time: 4000 }] },
+  ]};
+  const leg0 = getNextDeparture_(mock, 0);
+  console.assert(leg0?.getTime() === 2000 * 1000, 'FAIL: leg0 next departure');
+  const leg1 = getNextDeparture_(mock, 1);
+  console.assert(leg1?.getTime() === 4000 * 1000, 'FAIL: leg1 next departure');
+  const def = getNextDeparture_(mock);
+  console.assert(def?.getTime() === 2000 * 1000, 'FAIL: default should use leg 0');
+  const one = { legs: [{ leg_mode: 'transit', departures: [{ departure_time: 999 }] }] };
+  console.assert(getNextDeparture_(one) === null, 'FAIL: single departure should return null');
+  console.log('[PASS] test_getNextDeparture_');
+}
+
+function test_buildLegDescriptionBlocks_() {
+  const t = (s) => new Date(s * 1000);
+  const busTimes = [[t(1746041880), t(1746042600)], [t(1746043080), t(1746043320)]];
+  const busStops = [['Western Dr / Western Ct', 'UCSC - Lower Campus'],
+                    ['UCSC - Lower Campus', 'Bay / High']];
+  const legs = [
+    { leg_mode: 'transit', start_time: 1746041880, end_time: 1746042600,
+      routes: [{ route_short_name: '19' }] },
+    { leg_mode: 'transit', start_time: 1746043080, end_time: 1746043320,
+      routes: [{ route_short_name: '16' }] },
+  ];
+  const result = buildLegDescriptionBlocks_(busTimes, busStops, legs);
+  console.assert(result.includes('Leg 1 — Route 19'),    'FAIL: Leg 1 header');
+  console.assert(result.includes('Get on at:'),           'FAIL: Get on at line');
+  console.assert(result.includes('Get off at:'),          'FAIL: Get off at line');
+  console.assert(result.includes('Transfer: 8 min wait'), 'FAIL: transfer should be 8 min');
+  console.assert(result.includes('Leg 2 — Route 16'),    'FAIL: Leg 2 header');
+  console.log('[PASS] test_buildLegDescriptionBlocks_');
 }
