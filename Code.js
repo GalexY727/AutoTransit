@@ -337,7 +337,6 @@ function getVehicleOccupanciesForItinerary_(apiKey, itinerary) {
             request.directionId,
         );
         if (occupancy) occupancies[request.legIndex] = occupancy;
-        Utilities.sleep(10000);
     }
 
     return occupancies;
