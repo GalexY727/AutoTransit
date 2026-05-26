@@ -41,7 +41,7 @@ function runPlanner() {
         }).items || [];
 
     // Separate recent and upcoming events in memory
-    const events = allEvents.filter((e) => new Date(e.start.dateTime) > now);
+    const events = allEvents.filter((e) => isFutureTimedEvent_(e, now));
     
     // Pre-geocode home only when env_var changes
     if (homeAddress !== lastHomeAddress) {
@@ -64,10 +64,10 @@ function runPlanner() {
 
     for (const ev of events) {
         try {
+            if (!ev?.start?.dateTime) continue; // skip all-day or malformed events
             const eventStart = new Date(ev.start.dateTime);
             if (!shouldProcess_(ev, allEvents, targetCalendar, now, eventStart))
                 continue;
-            if (!ev.start || !ev.start.dateTime) continue; // skip all-day
             if (!ev.location) continue; // nowhere to route to
             const destLL = geocodeOrThrow_(ev.location);
 
@@ -79,10 +79,12 @@ function runPlanner() {
 
             // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
             upsertCommuteEvent_(targetCalendar, ev, itinerary, now, vehicleOccupancies);
-            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         } catch (e) {
             // Fail silently -- likely a rate-limit or transient API error
             console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
+        } finally {
+            // Run this on try or fail
+            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         }
     }
 }
@@ -93,6 +95,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
         eventStart.getTime() - minsToMs_(NEED_TRANSIT_THRESHOLD_MINS),
     );
     const recentEvents = allEvents.filter((e) => {
+        if (!e?.start?.dateTime || !e?.end?.dateTime) return false;
         const eStart = new Date(e.start.dateTime);
         const eEnd = new Date(e.end.dateTime);
         return ((eStart > thresholdStart || eEnd > thresholdStart) && eStart < eventStart); 
@@ -115,9 +118,11 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
             maxResults: 250,
         }).items || [];
 
-    if (recentTargetEvents.length !== 0) {
+    const timedRecentTargetEvents = sortTimedEventsByStart_(recentTargetEvents);
+
+    if (timedRecentTargetEvents.length !== 0) {
         // We have an AutoTransit entry: does it need updating?
-        const autoTransitEntry = recentTargetEvents[0];
+        const autoTransitEntry = timedRecentTargetEvents[0];
         const timeUntilDepart = new Date(autoTransitEntry.start.dateTime).getTime() - now.getTime();
         // Check if event is soon enough for realtime updating -- 'realtime' updating
         // The second clause is to force the event to double check for late arrivals
@@ -129,7 +134,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
 
     // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
     // * from the event start time
-    return recentTargetEvents.length === 0; // Process if no recent target events
+    return timedRecentTargetEvents.length === 0; // Process if no recent timed target events
 }
 
 // Uses Apps Script Maps service geocoder
@@ -145,13 +150,13 @@ function geocodeOrThrow_(address) {
 }
 
 function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
-    const arrival_time_ms = Math.floor(arriveByDate.getTime() / 1000);
+    const arrival_time_s = Math.floor(arriveByDate.getTime() / 1000);
     const qs = {
         from_lat: fromLL.lat,
         from_lon: fromLL.lon,
         to_lat: toLL.lat,
         to_lon: toLL.lon,
-        arrival_time: arrival_time_ms,
+        arrival_time: arrival_time_s,
         should_update_realtime: true,
         consider_downtimes: true,
         max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
@@ -184,18 +189,21 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
 
 // Pick the itinerary that arrives closest to 10 minutes before the event start
 function pickBestItinerary_(plan, eventStart) {
-    const itineraries = plan?.results || [];
+    const itineraries = (plan?.results || []).filter(result =>
+        typeof result?.start_time === 'number' &&
+        typeof result.end_time === 'number'
+    );
+    if (!itineraries.length) return null;
     // Compare in unix seconds to match the API's end_time field
     const idealTime = Math.floor(eventStart.getTime() / 1000) - 10 * 60;
     let bestResult = itineraries[0];
+    let bestDiff = Math.abs(idealTime - bestResult.end_time);
 
     for (const result of itineraries.slice(1)) {
-        const time = result?.end_time;
-        if (!time) continue;
-
-        const diff = Math.abs(idealTime - time);
-        if (diff < Math.abs(idealTime - bestResult.end_time)) {
+        const diff = Math.abs(idealTime - result.end_time);
+        if (diff < bestDiff) {
             bestResult = result;
+            bestDiff = diff;
         }
     }
     return bestResult || null;
@@ -211,7 +219,11 @@ function getBusNumber_(itinerary) {
 }
 
 function getTransitLegs_(itinerary) {
-    return (itinerary?.legs || []).filter(l => l.leg_mode === 'transit');
+    return (itinerary?.legs || []).filter(l =>
+        l?.leg_mode === 'transit' &&
+        typeof l.start_time === 'number' &&
+        typeof l.end_time === 'number'
+    );
 }
 
 function getTransferWaits_(transitLegs) {
@@ -360,11 +372,25 @@ function buildCrowdingLine_(leg, occupancyStatus) {
     return line;
 }
 
-function withOptionalLines_(lines) {
-    return lines.filter(Boolean).join("\n");
+function formatOptionalDescriptionLine_(line) {
+    return line ? line + "\n" : "";
 }
 
-function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, vehicleOccupancies) {
+function formatStopName_(stopName, parentSummary) {
+    return stopName || parentSummary || 'unknown stop | stay vigilant!';
+}
+
+function sortTimedEventsByStart_(events) {
+    return events
+        .filter(event => event?.start?.dateTime)
+        .sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
+}
+
+function isFutureTimedEvent_(event, now) {
+    return !!event?.start?.dateTime && new Date(event.start.dateTime) > now;
+}
+
+function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSummary, vehicleOccupancies) {
     // Builds the per-leg "Get on / Get off" section for combined multi-leg descriptions.
     // busTimes: [[dept, arrive], ...]   busStops: [[on, off], ...]
     const waits = getTransferWaits_(transitLegs);
@@ -373,13 +399,12 @@ function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, vehicleOccu
         const routeNum = transitLegs[i]?.routes?.[0]?.route_short_name || 'Bus';
         const [dept, arrive]    = busTimes[i];
         const [onStop, offStop] = busStops[i] || [null, null];
-        const fallback = 'unknown stop | stay vigilant!';
 
         lines.push(`Leg ${i + 1} — Route ${routeNum}`);
         const crowdingLine = buildCrowdingLine_(transitLegs[i], vehicleOccupancies?.[i]);
         if (crowdingLine) lines.push(crowdingLine);
-        lines.push(`Get on at:   ${ (onStop  || fallback) + ' @ ' + toRelativeTime_(dept)   }`);
-        lines.push(`Get off at:  ${ (offStop || fallback) + ' @ ' + toRelativeTime_(arrive) }`);
+        lines.push(`Get on at:   ${ formatStopName_(onStop, parentSummary) + ' @ ' + toRelativeTime_(dept) }`);
+        lines.push(`Get off at:  ${ formatStopName_(offStop, parentSummary) + ' @ ' + toRelativeTime_(arrive) }`);
 
         if (i < waits.length) {
             const waitMins = Math.round(waits[i] / 60);
@@ -448,8 +473,9 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             maxResults: 10,
         }).items || [];
 
-        // Sort ascending so hits[0] → leg 1 event, hits[1] → leg 2 event
-        allExisting.sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
+        // Sort ascending so hits[0] → leg 1 event, hits[1] → leg 2 event.
+        // Ignore all-day marker matches; split commute events are always timed.
+        const timedExisting = sortTimedEventsByStart_(allExisting);
 
         // Event 1: start when you leave home → end when you alight from bus 1
         // Event 2: start when you board bus 2 → end when you arrive at class
@@ -493,26 +519,26 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
 
             const legBody = {
                 summary: legSummary,
-                description: withOptionalLines_([
-                    legStatusLine,
-                    ' ➟ Last updated at ' + toRelativeTime_(now),
-                    '',
-                    crowdingLine,
-                    'Get on at:   ' + ((legStops?.[0] || 'unknown stop | stay vigilant!') + ' @ ' + toRelativeTime_(legTimes[0])),
-                    'Get off at:   ' + ((legStops?.[1] || 'unknown stop | stay vigilant!') + ' @ ' + toRelativeTime_(legTimes[1])),
-                    '',
-                    'Auto-generated by AutoTransit for:',
-                    (parentEv.summary || 'Event Name') + ' @ ' + (formatLocation_(parentEv.location) || 'Location'),
-                    '',
-                    marker,
-                ]),
+                description: dedent_
+                    `
+                    ${legStatusLine}
+                     ➟ Last updated at ${ toRelativeTime_(now) }
+
+                    ${formatOptionalDescriptionLine_(crowdingLine)}
+                    Get on at:   ${ formatStopName_(legStops?.[0], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[0]) }
+                    Get off at:   ${ formatStopName_(legStops?.[1], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[1]) }
+
+                    Auto-generated by AutoTransit for:
+                    ${parentEv.summary || 'Event Name'} @ ${formatLocation_(parentEv.location) || 'Location'}
+
+                    ${marker}`.trim(),
                 start: { dateTime: calStart.toISOString() },
                 end:   { dateTime: calEnd.toISOString() },
             };
 
-            if (allExisting[i]) {
+            if (timedExisting[i]) {
                 console.log('updating split event ' + (i + 1) + ': ', legSummary);
-                Calendar.Events.patch(legBody, calId, allExisting[i].id);
+                Calendar.Events.patch(legBody, calId, timedExisting[i].id);
             } else {
                 console.log('creating split event ' + (i + 1) + ': ', legSummary);
                 Calendar.Events.insert(legBody, calId);
@@ -520,9 +546,9 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
         }
 
         // Delete extras from a prior single/combined state (split→single/combined transition)
-        for (let i = transitLegs.length; i < allExisting.length; i++) {
-            console.log('deleting extra commute event: ', allExisting[i].summary);
-            Calendar.Events.remove(calId, allExisting[i].id);
+        for (let i = transitLegs.length; i < timedExisting.length; i++) {
+            console.log('deleting extra commute event: ', timedExisting[i].summary);
+            Calendar.Events.remove(calId, timedExisting[i].id);
         }
         return; // skip the single/combined-event path below
     }
@@ -540,6 +566,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             singleEvents: true,
             maxResults: 10,
         }).items || [];
+    const timedExisting = sortTimedEventsByStart_(existing);
 
     const summary = `🚍 ${busNumber || "Bus"} ${ within15Minutes ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
 
@@ -559,7 +586,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
-                ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, vehicleOccupancies) }
+                ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, parentEv.summary, vehicleOccupancies) }
 
                 Auto-generated by AutoTransit for:
                 ${parentEv.summary || "Event Name"} @ ${formatLocation_(parentEv.location) || "Location"}
@@ -570,9 +597,9 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
-                ${ crowdingLine ? crowdingLine + "\n" : "" }
-                Get on at:   ${ (relevantBusStops[0][0] || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[0][0]) }
-                Get off at:   ${ (relevantBusStops[0][1] || "unknown stop | stay vigilant!") + " @ " + toRelativeTime_(relevantBusTimes[0][1])}
+                ${formatOptionalDescriptionLine_(crowdingLine)}
+                Get on at:   ${ formatStopName_(relevantBusStops[0]?.[0], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][0]) }
+                Get off at:   ${ formatStopName_(relevantBusStops[0]?.[1], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][1])}
 
                 Auto-generated by AutoTransit for:
                 ${parentEv.summary || "Event Name"} @ ${formatLocation_(parentEv.location) || "Location"}
@@ -582,18 +609,18 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
         end: { dateTime: arrivalTime.toISOString() },
     };
 
-    if (existing.length) {
+    if (timedExisting.length) {
         console.log("updating: ", summary);
-        Calendar.Events.patch(body, calId, existing[0].id);
+        Calendar.Events.patch(body, calId, timedExisting[0].id);
     } else {
         console.log("creating: ", summary);
         Calendar.Events.insert(body, calId);
     }
 
     // Delete extras from a prior split-event state (split → single/combined transition)
-    for (let i = 1; i < existing.length; i++) {
-        console.log("deleting extra commute event: ", existing[i].summary);
-        Calendar.Events.remove(calId, existing[i].id);
+    for (let i = 1; i < timedExisting.length; i++) {
+        console.log("deleting extra commute event: ", timedExisting[i].summary);
+        Calendar.Events.remove(calId, timedExisting[i].id);
     }
 }
 
