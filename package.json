@@ -1,0 +1,31 @@
+{
+  "name": "autotransit",
+  "version": "1.0.0",
+  "description": "AutoTransit is a Google Apps Script application that integrates seamlessly with your Google Calendar. It automatically creates bus entries for your calendar events, so you can have all your planning in one place.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clasp": "clasp",
+    "push": "clasp push --force",
+    "version": "clasp version",
+    "deploy": "clasp deploy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GalexY727/AutoTransit.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/GalexY727/AutoTransit/issues"
+  },
+  "homepage": "https://github.com/GalexY727/AutoTransit#readme",
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  }
+}
