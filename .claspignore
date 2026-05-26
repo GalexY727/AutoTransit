@@ -1,1 +1,8 @@
 tests/**
+node_modules/**
+node_modules/
+.git/**
+.github/**
+npm-debug.log
+package-lock.json
+package.json
