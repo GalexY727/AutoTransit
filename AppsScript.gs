@@ -77,10 +77,12 @@ function runPlanner() {
 
             // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
             upsertCommuteEvent_(targetCalendar, ev, itinerary, now);
-            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         } catch (e) {
             // Fail silently -- likely a rate-limit or transient API error
             console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
+        } finally {
+            // Run this on try or fail
+            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         }
     }
 }
@@ -146,13 +148,13 @@ function geocodeOrThrow_(address) {
 }
 
 function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
-    const arrival_time_ms = Math.floor(arriveByDate.getTime() / 1000);
+    const arrival_time_s = Math.floor(arriveByDate.getTime() / 1000);
     const qs = {
         from_lat: fromLL.lat,
         from_lon: fromLL.lon,
         to_lat: toLL.lat,
         to_lon: toLL.lon,
-        arrival_time: arrival_time_ms,
+        arrival_time: arrival_time_s,
         should_update_realtime: true,
         consider_downtimes: true,
         max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
