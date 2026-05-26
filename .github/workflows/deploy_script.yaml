@@ -32,14 +32,4 @@ jobs:
       - name: Push to Apps Script
         run: npm run push
 
-      - name: Create Apps Script version
-        id: version
-        run: |
-          VERSION_OUTPUT=$(npx clasp version "Deploy from GitHub Actions - $GITHUB_SHA")
-          echo "$VERSION_OUTPUT"
-
-          VERSION_NUMBER=$(echo "$VERSION_OUTPUT" | grep -oE '[0-9]+$')
-          echo "version_number=$VERSION_NUMBER" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy Apps Script version
-        run: npx clasp deploy --versionNumber ${{ steps.version.outputs.version_number }} --description "GitHub Actions deploy - $GITHUB_SHA"
+      # this project doesn't need a deployment
