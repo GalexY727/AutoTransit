@@ -1,0 +1,45 @@
+name: Deploy Apps Script
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Write clasp auth config
+        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+
+      - name: Write clasp project config
+        run: echo '${{ secrets.CLASP_JSON }}' > .clasp.json
+
+      - name: Push to Apps Script
+        run: npm run push
+
+      - name: Create Apps Script version
+        id: version
+        run: |
+          VERSION_OUTPUT=$(npx clasp version "Deploy from GitHub Actions - $GITHUB_SHA")
+          echo "$VERSION_OUTPUT"
+
+          VERSION_NUMBER=$(echo "$VERSION_OUTPUT" | grep -oE '[0-9]+$')
+          echo "version_number=$VERSION_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Apps Script version
+        run: npx clasp deploy --versionNumber ${{ steps.version.outputs.version_number }} --description "GitHub Actions deploy - $GITHUB_SHA"
