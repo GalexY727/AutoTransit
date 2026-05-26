@@ -42,6 +42,7 @@ function runPlanner() {
 
     // Separate recent and upcoming events in memory
     const events = allEvents.filter((e) => isFutureTimedEvent_(e, now));
+    const changeTracker = createEventChangeTracker_();
     
     // Pre-geocode home only when env_var changes
     if (homeAddress !== lastHomeAddress) {
@@ -78,7 +79,7 @@ function runPlanner() {
             const vehicleOccupancies = getVehicleOccupanciesForItinerary_(apiKey, itinerary);
 
             // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
-            upsertCommuteEvent_(targetCalendar, ev, itinerary, now, vehicleOccupancies);
+            upsertCommuteEvent_(targetCalendar, ev, itinerary, now, vehicleOccupancies, changeTracker);
         } catch (e) {
             // Fail silently -- likely a rate-limit or transient API error
             console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
@@ -87,6 +88,8 @@ function runPlanner() {
             Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         }
     }
+
+    logEventChangeSummary_(changeTracker);
 }
 
 function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
@@ -430,7 +433,64 @@ function getRelativeTime_(futureDate) {
     return rtf.format(days, 'day');
 }
 
-function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies) {
+function createEventChangeTracker_() {
+    return {
+        count: 0,
+        log: (line) => console.log(line),
+    };
+}
+
+function formatEventChangeLogLine_(action, busNumber, destination, date) {
+    const normalizedAction = (action || "changed").toLowerCase();
+    const formattedAction = normalizedAction.charAt(0).toUpperCase() + normalizedAction.slice(1);
+    const formattedBus = busNumber || "Bus";
+    const formattedDestination = destination || "(untitled)";
+    const formattedDate = date.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+    });
+
+    return `${formattedAction} ${formattedBus} to ${formattedDestination} on ${formattedDate}`;
+}
+
+function recordEventChange_(tracker, change) {
+    if (!tracker) return;
+
+    tracker.count++;
+    tracker.log(formatEventChangeLogLine_(
+        change.action,
+        change.busNumber,
+        change.destination,
+        change.date,
+    ));
+}
+
+function logEventChangeSummary_(tracker) {
+    const count = tracker?.count || 0;
+    console.log(`AutoTransit made ${count} ${count === 1 ? "change" : "changes"}.`);
+}
+
+function parseEventChangeDetailsFromSummary_(summary) {
+    const fallback = {
+        busNumber: "Bus",
+        destination: summary || "(untitled)",
+    };
+    if (!summary) return fallback;
+
+    const match = summary.match(/^(?::oncoming_bus:|🚍)\s+(.+?)\s+to:\s+(.+)$/);
+    if (!match) return fallback;
+
+    const busNumber = match[1]
+        .replace(/\s+(?:this minute|in \d+ minutes?)$/, "")
+        .trim();
+    return {
+        busNumber: busNumber || "Bus",
+        destination: match[2] || "(untitled)",
+    };
+}
+
+function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies, changeTracker) {
     const goTime = new Date(itinerary.start_time * 1000);
     const arrivalTime = new Date(itinerary.end_time * 1000);
     const busNumber = getBusNumber_(itinerary);
@@ -537,18 +597,34 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             };
 
             if (timedExisting[i]) {
-                console.log('updating split event ' + (i + 1) + ': ', legSummary);
                 Calendar.Events.patch(legBody, calId, timedExisting[i].id);
+                recordEventChange_(changeTracker, {
+                    action: "updated",
+                    busNumber: legBusNum,
+                    destination: toTarget,
+                    date: calStart,
+                });
             } else {
-                console.log('creating split event ' + (i + 1) + ': ', legSummary);
                 Calendar.Events.insert(legBody, calId);
+                recordEventChange_(changeTracker, {
+                    action: "made",
+                    busNumber: legBusNum,
+                    destination: toTarget,
+                    date: calStart,
+                });
             }
         }
 
         // Delete extras from a prior single/combined state (split→single/combined transition)
         for (let i = transitLegs.length; i < timedExisting.length; i++) {
-            console.log('deleting extra commute event: ', timedExisting[i].summary);
+            const changeDetails = parseEventChangeDetailsFromSummary_(timedExisting[i].summary);
             Calendar.Events.remove(calId, timedExisting[i].id);
+            recordEventChange_(changeTracker, {
+                action: "deleted",
+                busNumber: changeDetails.busNumber,
+                destination: changeDetails.destination,
+                date: new Date(timedExisting[i].start.dateTime),
+            });
         }
         return; // skip the single/combined-event path below
     }
@@ -610,17 +686,33 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     };
 
     if (timedExisting.length) {
-        console.log("updating: ", summary);
         Calendar.Events.patch(body, calId, timedExisting[0].id);
+        recordEventChange_(changeTracker, {
+            action: "updated",
+            busNumber: busNumber || "Bus",
+            destination: parentEv.summary || "(untitled)",
+            date: goTime,
+        });
     } else {
-        console.log("creating: ", summary);
         Calendar.Events.insert(body, calId);
+        recordEventChange_(changeTracker, {
+            action: "made",
+            busNumber: busNumber || "Bus",
+            destination: parentEv.summary || "(untitled)",
+            date: goTime,
+        });
     }
 
     // Delete extras from a prior split-event state (split → single/combined transition)
     for (let i = 1; i < timedExisting.length; i++) {
-        console.log("deleting extra commute event: ", timedExisting[i].summary);
+        const changeDetails = parseEventChangeDetailsFromSummary_(timedExisting[i].summary);
         Calendar.Events.remove(calId, timedExisting[i].id);
+        recordEventChange_(changeTracker, {
+            action: "deleted",
+            busNumber: changeDetails.busNumber,
+            destination: changeDetails.destination,
+            date: new Date(timedExisting[i].start.dateTime),
+        });
     }
 }
 

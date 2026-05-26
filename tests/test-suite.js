@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const vm = require('vm');
 
-const source = fs.readFileSync('AppsScript.gs', 'utf8');
+const source = fs.readFileSync('Code.js', 'utf8');
 const context = {
   console,
   Intl,
@@ -113,6 +113,54 @@ test('cleanCommuteSummaryCountdown_ removes this minute and in n minute countdow
     'Foo Bar in 1 minute to: leave',
   );
 });
+
+test('formatEventChangeLogLine_ describes event writes with route, destination, and date', () => {
+  const date = new Date(2026, 0, 2, 8, 30);
+
+  assert.strictEqual(
+    context.formatEventChangeLogLine_('made', '18', 'CSE 101', date),
+    'Made 18 to CSE 101 on Jan 2, 2026',
+  );
+  assert.strictEqual(
+    context.formatEventChangeLogLine_('updated', 'Bus', '(untitled)', date),
+    'Updated Bus to (untitled) on Jan 2, 2026',
+  );
+  assert.strictEqual(
+    context.formatEventChangeLogLine_('deleted', null, null, date),
+    'Deleted Bus to (untitled) on Jan 2, 2026',
+  );
+});
+
+test('recordEventChange_ logs each change and increments the tracker', () => {
+  const lines = [];
+  const tracker = createChangeTracker_(lines);
+
+  context.recordEventChange_(tracker, {
+    action: 'made',
+    busNumber: '19',
+    destination: 'Science Hill',
+    date: new Date(2026, 0, 3, 9, 15),
+  });
+  context.recordEventChange_(tracker, {
+    action: 'deleted',
+    busNumber: '20',
+    destination: 'Old commute',
+    date: new Date(2026, 0, 4, 10, 45),
+  });
+
+  assert.strictEqual(tracker.count, 2);
+  assert.strictEqual(JSON.stringify(lines), JSON.stringify([
+    'Made 19 to Science Hill on Jan 3, 2026',
+    'Deleted 20 to Old commute on Jan 4, 2026',
+  ]));
+});
+
+function createChangeTracker_(lines) {
+  return {
+    count: 0,
+    log: (line) => lines.push(line),
+  };
+}
 
 test('cleanupPastCommuteEventTitlesBatch_ only patches completed countdown events', () => {
   const now = new Date(2026, 0, 1, 13, 0);
