@@ -1,5 +1,6 @@
 const NEED_TRANSIT_THRESHOLD_MINS = 90;
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
+const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
 const SPLIT_TRANSFER_THRESHOLD_SECS = 15 * 60; // 900 s — transfers at or above this use split events
 const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 
@@ -41,6 +42,7 @@ function runPlanner() {
 
     // Separate recent and upcoming events in memory
     const events = allEvents.filter((e) => isFutureTimedEvent_(e, now));
+    const changeTracker = createEventChangeTracker_();
     
     // Pre-geocode home only when env_var changes
     if (homeAddress !== lastHomeAddress) {
@@ -74,9 +76,10 @@ function runPlanner() {
             if (!plan) continue; // API call failed silently (e.g. rate-limit)
             const itinerary = pickBestItinerary_(plan, eventStart);
             if (!itinerary) continue;
+            const vehicleOccupancies = getVehicleOccupanciesForItinerary_(apiKey, itinerary);
 
             // Create a buffer ending at the meeting start; if routing arrives earlier, you can pad later.
-            upsertCommuteEvent_(targetCalendar, ev, itinerary, now);
+            upsertCommuteEvent_(targetCalendar, ev, itinerary, now, vehicleOccupancies, changeTracker);
         } catch (e) {
             // Fail silently -- likely a rate-limit or transient API error
             console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
@@ -85,6 +88,8 @@ function runPlanner() {
             Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
         }
     }
+
+    logEventChangeSummary_(changeTracker);
 }
 
 function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
@@ -269,6 +274,110 @@ function getNextDeparture_(itinerary, legIndex) {
     return new Date(departures[1].departure_time * 1000);
 }
 
+function extractVehicleRequestsForItinerary_(itinerary) {
+    const requests = [];
+    const legs = itinerary?.legs || [];
+    let transitLegIndex = 0;
+
+    for (const leg of legs) {
+        if (leg.leg_mode !== "transit") continue;
+
+        const route = leg?.routes?.[0];
+        const isBus = route?.route_type === 3 || route?.vehicle?.name === "bus";
+        const globalRouteId = route?.global_route_id;
+        if (isBus && globalRouteId) {
+            const directionId = route?.itineraries?.[0]?.direction_id;
+            requests.push({
+                legIndex: transitLegIndex,
+                globalRouteId,
+                directionId,
+            });
+        }
+
+        transitLegIndex++;
+    }
+
+    return requests;
+}
+
+function fetchVehicleOccupancy_(apiKey, globalRouteId, directionId) {
+    const qs = { global_route_id: globalRouteId };
+    if (directionId === 0 || directionId === 1) qs.direction_id = directionId;
+
+    const url = "https://external.transitapp.com/v4/vehicles?" + toQuery_(qs);
+    try {
+        const resp = UrlFetchApp.fetch(url, {
+            method: "get",
+            headers: { apiKey: apiKey },
+            muteHttpExceptions: true,
+        });
+        if (resp.getResponseCode() >= 300) {
+            console.log(
+                "Transit vehicles API returned " +
+                    resp.getResponseCode() +
+                    ": " +
+                    resp.getContentText(),
+            );
+            return null;
+        }
+
+        const vehicles = JSON.parse(resp.getContentText())?.vehicles || [];
+        return vehicles[0]?.occupancy_status ?? null;
+    } catch (e) {
+        console.log("Transit vehicles API fetch failed (silent): " + e.message);
+        return null;
+    }
+}
+
+function getVehicleOccupanciesForItinerary_(apiKey, itinerary) {
+    const occupancies = {};
+    const requests = extractVehicleRequestsForItinerary_(itinerary);
+
+    for (const request of requests) {
+        const occupancy = fetchVehicleOccupancy_(
+            apiKey,
+            request.globalRouteId,
+            request.directionId,
+        );
+        if (occupancy) occupancies[request.legIndex] = occupancy;
+    }
+
+    return occupancies;
+}
+
+function getOccupancyText_(occupancyStatus) {
+    switch (occupancyStatus) {
+        case 1:
+            return "not crowded";
+        case 2:
+            return "some crowding";
+        case 3:
+            return "crowded";
+        default:
+            return "";
+    }
+}
+
+function buildCrowdingLine_(leg, occupancyStatus) {
+    const occupancyText = getOccupancyText_(occupancyStatus);
+    if (!occupancyText) return "";
+
+    let line = "Crowding: " + occupancyText;
+    if (occupancyStatus === 3) {
+        const departures = leg?.departures || [];
+        if (departures.length >= 2) {
+            const nextDeparture = new Date(departures[1].departure_time * 1000);
+            line += ". If skipped, next departure is at " + toRelativeTime_(nextDeparture);
+        }
+    }
+
+    return line;
+}
+
+function formatOptionalDescriptionLine_(line) {
+    return line ? line + "\n" : "";
+}
+
 function formatStopName_(stopName, parentSummary) {
     return stopName || parentSummary || 'unknown stop | stay vigilant!';
 }
@@ -283,7 +392,7 @@ function isFutureTimedEvent_(event, now) {
     return !!event?.start?.dateTime && new Date(event.start.dateTime) > now;
 }
 
-function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSummary) {
+function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSummary, vehicleOccupancies) {
     // Builds the per-leg "Get on / Get off" section for combined multi-leg descriptions.
     // busTimes: [[dept, arrive], ...]   busStops: [[on, off], ...]
     const waits = getTransferWaits_(transitLegs);
@@ -294,6 +403,8 @@ function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSumma
         const [onStop, offStop] = busStops[i] || [null, null];
 
         lines.push(`Leg ${i + 1} — Route ${routeNum}`);
+        const crowdingLine = buildCrowdingLine_(transitLegs[i], vehicleOccupancies?.[i]);
+        if (crowdingLine) lines.push(crowdingLine);
         lines.push(`Get on at:   ${ formatStopName_(onStop, parentSummary) + ' @ ' + toRelativeTime_(dept) }`);
         lines.push(`Get off at:  ${ formatStopName_(offStop, parentSummary) + ' @ ' + toRelativeTime_(arrive) }`);
 
@@ -321,7 +432,64 @@ function getRelativeTime_(futureDate) {
     return rtf.format(days, 'day');
 }
 
-function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
+function createEventChangeTracker_() {
+    return {
+        count: 0,
+        log: (line) => console.log(line),
+    };
+}
+
+function formatEventChangeLogLine_(action, busNumber, destination, date) {
+    const normalizedAction = (action || "changed").toLowerCase();
+    const formattedAction = normalizedAction.charAt(0).toUpperCase() + normalizedAction.slice(1);
+    const formattedBus = busNumber || "Bus";
+    const formattedDestination = destination || "(untitled)";
+    const formattedDate = date.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+    });
+
+    return `${formattedAction} ${formattedBus} to ${formattedDestination} on ${formattedDate}`;
+}
+
+function recordEventChange_(tracker, change) {
+    if (!tracker) return;
+
+    tracker.count++;
+    tracker.log(formatEventChangeLogLine_(
+        change.action,
+        change.busNumber,
+        change.destination,
+        change.date,
+    ));
+}
+
+function logEventChangeSummary_(tracker) {
+    const count = tracker?.count || 0;
+    console.log(`AutoTransit made ${count} ${count === 1 ? "change" : "changes"}.`);
+}
+
+function parseEventChangeDetailsFromSummary_(summary) {
+    const fallback = {
+        busNumber: "Bus",
+        destination: summary || "(untitled)",
+    };
+    if (!summary) return fallback;
+
+    const match = summary.match(/^(?::oncoming_bus:|🚍)\s+(.+?)\s+to:\s+(.+)$/);
+    if (!match) return fallback;
+
+    const busNumber = match[1]
+        .replace(/\s+(?:this minute|in \d+ minutes?)$/, "")
+        .trim();
+    return {
+        busNumber: busNumber || "Bus",
+        destination: match[2] || "(untitled)",
+    };
+}
+
+function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies, changeTracker) {
     const goTime = new Date(itinerary.start_time * 1000);
     const arrivalTime = new Date(itinerary.end_time * 1000);
     const busNumber = getBusNumber_(itinerary);
@@ -392,6 +560,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
             const legRelativeTime = getRelativeTime_(legGoTime);
             // Check next departure for this specific leg
             const legNextDepart = legAlreadyLeft ? getNextDeparture_(itinerary, i) : null;
+            const crowdingLine = buildCrowdingLine_(leg, vehicleOccupancies?.[i]);
 
             // Non-last leg title: "🚍 19 to: UCSC - Lower Campus" (transfer stop)
             // Last leg title:     "🚍 16 to: ECE 10"              (class name)
@@ -414,6 +583,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
                     ${legStatusLine}
                      ➟ Last updated at ${ toRelativeTime_(now) }
 
+                    ${formatOptionalDescriptionLine_(crowdingLine)}
                     Get on at:   ${ formatStopName_(legStops?.[0], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[0]) }
                     Get off at:   ${ formatStopName_(legStops?.[1], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[1]) }
 
@@ -426,18 +596,34 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
             };
 
             if (timedExisting[i]) {
-                console.log('updating split event ' + (i + 1) + ': ', legSummary);
                 Calendar.Events.patch(legBody, calId, timedExisting[i].id);
+                recordEventChange_(changeTracker, {
+                    action: "updated",
+                    busNumber: legBusNum,
+                    destination: toTarget,
+                    date: calStart,
+                });
             } else {
-                console.log('creating split event ' + (i + 1) + ': ', legSummary);
                 Calendar.Events.insert(legBody, calId);
+                recordEventChange_(changeTracker, {
+                    action: "made",
+                    busNumber: legBusNum,
+                    destination: toTarget,
+                    date: calStart,
+                });
             }
         }
 
         // Delete extras from a prior single/combined state (split→single/combined transition)
         for (let i = transitLegs.length; i < timedExisting.length; i++) {
-            console.log('deleting extra commute event: ', timedExisting[i].summary);
+            const changeDetails = parseEventChangeDetailsFromSummary_(timedExisting[i].summary);
             Calendar.Events.remove(calId, timedExisting[i].id);
+            recordEventChange_(changeTracker, {
+                action: "deleted",
+                busNumber: changeDetails.busNumber,
+                destination: changeDetails.destination,
+                date: new Date(timedExisting[i].start.dateTime),
+            });
         }
         return; // skip the single/combined-event path below
     }
@@ -465,6 +651,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
         ? `Bus left at ${ toRelativeTime_(relevantBusTimes[0][0]) }` +
           (nextDeparture ? `. Next departure is at ${ toRelativeTime_(nextDeparture) }` : "")
         : `Bus leaves ${ relativeLeaveTime } at ${ toRelativeTime_(relevantBusTimes[0][0]) }`;
+    const crowdingLine = buildCrowdingLine_(transitLegs[0], vehicleOccupancies?.[0]);
 
     const body = {
         summary,
@@ -474,7 +661,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
-                ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, parentEv.summary) }
+                ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, parentEv.summary, vehicleOccupancies) }
 
                 Auto-generated by AutoTransit for:
                 ${parentEv.summary || "Event Name"} @ ${formatLocation_(parentEv.location) || "Location"}
@@ -485,6 +672,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
+                ${formatOptionalDescriptionLine_(crowdingLine)}
                 Get on at:   ${ formatStopName_(relevantBusStops[0]?.[0], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][0]) }
                 Get off at:   ${ formatStopName_(relevantBusStops[0]?.[1], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][1])}
 
@@ -497,18 +685,105 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now) {
     };
 
     if (timedExisting.length) {
-        console.log("updating: ", summary);
         Calendar.Events.patch(body, calId, timedExisting[0].id);
+        recordEventChange_(changeTracker, {
+            action: "updated",
+            busNumber: busNumber || "Bus",
+            destination: parentEv.summary || "(untitled)",
+            date: goTime,
+        });
     } else {
-        console.log("creating: ", summary);
         Calendar.Events.insert(body, calId);
+        recordEventChange_(changeTracker, {
+            action: "made",
+            busNumber: busNumber || "Bus",
+            destination: parentEv.summary || "(untitled)",
+            date: goTime,
+        });
     }
 
     // Delete extras from a prior split-event state (split → single/combined transition)
     for (let i = 1; i < timedExisting.length; i++) {
-        console.log("deleting extra commute event: ", timedExisting[i].summary);
+        const changeDetails = parseEventChangeDetailsFromSummary_(timedExisting[i].summary);
         Calendar.Events.remove(calId, timedExisting[i].id);
+        recordEventChange_(changeTracker, {
+            action: "deleted",
+            busNumber: changeDetails.busNumber,
+            destination: changeDetails.destination,
+            date: new Date(timedExisting[i].start.dateTime),
+        });
     }
+}
+
+function cleanCommuteSummaryCountdown_(summary) {
+    if (!summary) return summary;
+    return summary.replace(
+        /^((?::oncoming_bus:|🚍)\s+.+?)\s+(?:this minute|in \d+ minutes?)\s+(to:\s+)/,
+        "$1 $2",
+    );
+}
+
+function cleanupPastCommuteEventTitles() {
+    const props = PropertiesService.getScriptProperties();
+    const targetCalendar =
+        props.getProperty("TARGET_CALENDAR_ID") || "AutoTransit";
+    const result = cleanupPastCommuteEventTitlesBatch_(targetCalendar, {
+        pageToken: props.getProperty(CLEANUP_PAGE_TOKEN_PROP),
+    });
+
+    if (result.nextPageToken) {
+        props.setProperty(CLEANUP_PAGE_TOKEN_PROP, result.nextPageToken);
+    } else if (!result.stoppedEarly) {
+        props.deleteProperty(CLEANUP_PAGE_TOKEN_PROP);
+    }
+}
+
+function cleanupPastCommuteEventTitlesBatch_(calId, options) {
+    options = options || {};
+    const now = options.now || new Date();
+    const timeMin = options.timeMin || new Date(2000, 0, 1);
+    const maxUpdates = options.maxUpdates || 50;
+    const sleepMs = options.sleepMs ?? 250;
+    const pageToken = options.pageToken || null;
+
+    const params = {
+        timeMin: timeMin.toISOString(),
+        timeMax: now.toISOString(),
+        singleEvents: true,
+        orderBy: "startTime",
+        maxResults: 250,
+    };
+    if (pageToken) params.pageToken = pageToken;
+
+    const result = Calendar.Events.list(calId, params);
+    const events = result.items || [];
+    let updated = 0;
+
+    for (const ev of events) {
+        const end = new Date(ev?.end?.dateTime || ev?.end?.date || 0);
+        if (!(end < now)) continue;
+
+        const cleanSummary = cleanCommuteSummaryCountdown_(ev.summary);
+        if (cleanSummary === ev.summary) continue;
+
+        Calendar.Events.patch({ summary: cleanSummary }, calId, ev.id);
+        updated++;
+        if (sleepMs > 0) Utilities.sleep(sleepMs);
+        if (updated >= maxUpdates) {
+            console.log(
+                "Updated " + updated +
+                " event titles. Run cleanupPastCommuteEventTitles() again to continue.",
+            );
+            return { updated, nextPageToken: result.nextPageToken || null, stoppedEarly: true };
+        }
+    }
+
+    console.log(
+        "Updated " + updated +
+        " event titles." +
+        (result.nextPageToken ? " Run cleanupPastCommuteEventTitles() again for the next page." : ""),
+    );
+    return { updated, nextPageToken: result.nextPageToken || null, stoppedEarly: false };
 }
 
 function toQuery_(obj) {
