@@ -2,6 +2,8 @@ const NEED_TRANSIT_THRESHOLD_MINS = 90;
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
 const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
 const SPLIT_TRANSFER_THRESHOLD_SECS = 15 * 60; // 900 s — transfers at or above this use split events
+const TRANSFER_MIN_SAVINGS_SECS = 5 * 60;
+const SIMILAR_ITINERARY_DURATION_SECS = 5 * 60;
 const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 
 
@@ -162,12 +164,12 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
         arrival_time: arrival_time_s,
         should_update_realtime: true,
         consider_downtimes: true,
-        max_num_departures: 3, // fetch the next departure so we can surface it after the bus leaves
+        max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
         num_result: 3,
-        max_num_legs: 3,
+        max_num_legs: 5,
         walk_reluctance: 1.1,
         walk_speed: 0.89,
-        should_include_directions: true,
+        should_include_directions: false,
         walk_fallback: true
     };
 
@@ -196,7 +198,8 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
     }
 }
 
-// Pick the itinerary that arrives closest to 10 minutes before the event start
+// Pick the itinerary that is fast, arrives near 10 minutes before the event,
+// minimizes walking, and avoids transfers unless they save more than 5 minutes.
 function pickBestItinerary_(plan, eventStart) {
     const itineraries = (plan?.results || []).filter(result =>
         typeof result?.start_time === 'number' &&
@@ -205,17 +208,83 @@ function pickBestItinerary_(plan, eventStart) {
     if (!itineraries.length) return null;
     // Compare in unix seconds to match the API's end_time field
     const idealTime = Math.floor(eventStart.getTime() / 1000) - 10 * 60;
-    let bestResult = itineraries[0];
-    let bestDiff = Math.abs(idealTime - bestResult.end_time);
+    const scored = itineraries
+        .map((result, index) => scoreItinerary_(result, idealTime, index))
+        .filter(score => Number.isFinite(score.duration));
+    if (!scored.length) return null;
 
-    for (const result of itineraries.slice(1)) {
-        const diff = Math.abs(idealTime - result.end_time);
-        if (diff < bestDiff) {
-            bestResult = result;
-            bestDiff = diff;
-        }
+    const transitScores = scored.filter(score => score.transitLegCount > 0);
+    let candidates = scored;
+
+    if (transitScores.length) {
+        const fastestTransitDuration = Math.min(...transitScores.map(score => score.duration));
+        candidates = candidates.filter(score =>
+            score.transitLegCount > 0 || score.duration < fastestTransitDuration
+        );
     }
-    return bestResult || null;
+
+    const directTransitScores = transitScores.filter(score => score.transitLegCount === 1);
+    if (directTransitScores.length) {
+        const fastestDirectDuration = Math.min(...directTransitScores.map(score => score.duration));
+        candidates = candidates.filter(score =>
+            score.transferCount === 0 ||
+            score.duration + TRANSFER_MIN_SAVINGS_SECS < fastestDirectDuration
+        );
+    }
+
+    const fastestCandidateDuration = Math.min(...candidates.map(score => score.duration));
+    const similarCandidates = candidates.filter(score =>
+        score.duration <= fastestCandidateDuration + SIMILAR_ITINERARY_DURATION_SECS
+    );
+
+    similarCandidates.sort((a, b) =>
+        a.arrivalDiff - b.arrivalDiff ||
+        a.walkSeconds - b.walkSeconds ||
+        a.transferCount - b.transferCount ||
+        a.duration - b.duration ||
+        a.index - b.index
+    );
+
+    return similarCandidates[0]?.result || null;
+}
+
+function scoreItinerary_(itinerary, idealTime, index) {
+    const transitLegCount = getTransitLegs_(itinerary).length;
+    return {
+        result: itinerary,
+        index,
+        duration: getItineraryDurationSeconds_(itinerary),
+        arrivalDiff: Math.abs(idealTime - itinerary.end_time),
+        walkSeconds: getWalkingDurationSeconds_(itinerary),
+        transitLegCount,
+        transferCount: Math.max(0, transitLegCount - 1),
+    };
+}
+
+function getItineraryDurationSeconds_(itinerary) {
+    if (typeof itinerary?.duration === 'number') return itinerary.duration;
+    if (
+        typeof itinerary?.start_time === 'number' &&
+        typeof itinerary?.end_time === 'number'
+    ) {
+        return itinerary.end_time - itinerary.start_time;
+    }
+    return NaN;
+}
+
+function getWalkingDurationSeconds_(itinerary) {
+    return (itinerary?.legs || [])
+        .filter(leg => leg?.leg_mode === 'walk')
+        .reduce((total, leg) => {
+            if (typeof leg.duration === 'number') return total + leg.duration;
+            if (
+                typeof leg.start_time === 'number' &&
+                typeof leg.end_time === 'number'
+            ) {
+                return total + Math.max(0, leg.end_time - leg.start_time);
+            }
+            return total;
+        }, 0);
 }
 
 function getBusNumber_(itinerary) {
