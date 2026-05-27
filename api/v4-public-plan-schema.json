@@ -1,0 +1,179 @@
+results
+Type: array object[]
+
+A list of results. It can be empty if no results are found.
+
+    accessibility
+    Type: stringenum
+    required
+
+    Indicates whether this result is wheelchair accessible. The possible values are:
+        None: not accessible
+        WheelchairStrict: entirely accessible
+        WheelchairTripsWithUnknownStops: The selected trip routes/vehicles are wheelchair accessible, but some stops used in the trip have unknown wheelchair accessibility status.
+    values
+        WheelchairStrict
+        None
+        WheelchairTripsWithUnknownStops
+    duration
+    Type: integer
+    required
+
+    The expected duration of the trip, in seconds.
+    end_time
+    Type: integer
+    required
+
+    The expected start time in unix time
+    start_time
+    Type: integer
+    required
+
+    The expected start time in unix time
+    fare
+    Type: object
+
+    Object representing the price to pay for the entire trip plan. In most cases, the high and low price should be the same but can be different in some microtransit and bikeshare plans. Can be null if the fare is unknown.
+        high_price
+        Type: object · Price
+            currency_code
+            Type: string
+            required
+
+            ISO 4217 currency code
+            symbol
+            Type: string
+            required
+
+            Currency symbol
+            text
+            Type: string
+            required
+
+            Formatted price with value and currency symbol
+            value
+            Type: number
+            required
+
+            Price value as a float
+        low_price
+        Type: object · Price
+            currency_code
+            Type: string
+            required
+
+            ISO 4217 currency code
+            symbol
+            Type: string
+            required
+
+            Currency symbol
+            text
+            Type: string
+            required
+
+            Formatted price with value and currency symbol
+            value
+            Type: number
+            required
+
+            Price value as a float
+    legs
+    Type: array 1…
+
+    Ordered array of the different legs of this trip. Each leg can be of different type, defined in leg_mode with the same values as the query param mode.
+
+        Simple leg, used for walk for personal_bike legs
+            directions
+            Type: array object[]
+
+            Directions are only available if should_include_directions is set to true. They give precise information on the steps to follow for this leg.
+
+            each object is a step, containing an instruction and some data about it.
+                angle
+                Type: numberFormat: double
+
+                the angle to continue to the next instruction in degrees.
+                duration
+                Type: numberFormat: double
+
+                the step duration in seconds
+                entrance
+                Type: object
+
+                Details about the entrance when entering a transit station (optional).
+                    raw_stop_id
+                    Type: string
+
+                    The GTFS stop_id of the entrance.
+                    stop_code
+                    Type: string
+
+                    The GTFS stop_code of the entrance.
+                    stop_name
+                    Type: string
+
+                    The name of the entrance.
+                exit
+                Type: object
+
+                Details about the exit when leaving a transit station (optional).
+                    raw_stop_id
+                    Type: string
+
+                    The GTFS stop_id of the exit.
+                    stop_code
+                    Type: string
+
+                    The GTFS stop_code of the exit.
+                    stop_name
+                    Type: string
+
+                    The name of the exit.
+                instruction
+                Type: string
+
+                the detailed instruction to be displayed to the user.
+                length
+                Type: numberFormat: double
+
+                the step length in meters
+                pathway_mode
+                Type: string
+
+                The GTFS pathway mode for this step (e.g. WALKWAY, STAIRS, ESCALATOR, ELEVATOR, FARE_GATE, EXIT_GATE, MOVING_SIDEWALK). Only present when should_include_pathways is true and the step is part of a station pathway.
+                polyline
+                Type: string
+
+                Shape of the step provided in the encoded polyline format.
+                way_name
+                Type: string
+
+                the name of the way we are currently on.
+            distance
+            Type: integer
+
+            Total distance traveled of the leg
+            duration
+            Type: integer
+
+            Travel duration in seconds
+            end_time
+            Type: integer
+
+            The expected end time in unix time
+            leg_mode
+            Type: stringenum
+
+            The mode of the current leg. In simple legs, it can be either walk or personal_bike.
+            values
+                walk
+                personal_bike
+            polyline
+            Type: string
+
+            Shape of the traveled path provided in the encoded polyline format.
+            start_time
+            Type: integer
+
+            The expected start time in unix time

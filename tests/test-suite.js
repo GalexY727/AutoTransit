@@ -47,6 +47,24 @@ function transitLeg(routeOverrides = {}) {
   };
 }
 
+function walkLeg(duration, startTime = 0) {
+  return {
+    leg_mode: 'walk',
+    start_time: startTime,
+    end_time: startTime + duration,
+    duration,
+  };
+}
+
+function planResult({ duration, endTime, legs }) {
+  return {
+    start_time: endTime - duration,
+    end_time: endTime,
+    duration,
+    legs,
+  };
+}
+
 function test(name, fn) {
   try {
     fn();
@@ -56,6 +74,98 @@ function test(name, fn) {
     throw error;
   }
 }
+
+test('pickBestItinerary_ keeps a direct bus when a transfer is not more than 5 minutes faster', () => {
+  const eventStart = new Date(10_000 * 1000);
+  const direct = planResult({
+    duration: 1800,
+    endTime: 9300,
+    legs: [
+      walkLeg(120, 7500),
+      transitLeg(),
+      walkLeg(60, 9240),
+    ],
+  });
+  const transfer = planResult({
+    duration: 1600,
+    endTime: 9400,
+    legs: [
+      walkLeg(120, 7800),
+      transitLeg({ route_short_name: '18' }),
+      transitLeg({ route_short_name: 'Loop' }),
+      walkLeg(60, 9340),
+    ],
+  });
+
+  assert.strictEqual(
+    context.pickBestItinerary_({ results: [transfer, direct] }, eventStart),
+    direct,
+  );
+});
+
+test('pickBestItinerary_ allows a transfer when it cuts total trip time by more than 5 minutes', () => {
+  const eventStart = new Date(10_000 * 1000);
+  const direct = planResult({
+    duration: 2400,
+    endTime: 9300,
+    legs: [
+      walkLeg(120, 6900),
+      transitLeg(),
+      walkLeg(60, 9240),
+    ],
+  });
+  const transfer = planResult({
+    duration: 2000,
+    endTime: 9400,
+    legs: [
+      walkLeg(120, 7400),
+      transitLeg({ route_short_name: '18' }),
+      transitLeg({ route_short_name: '19' }),
+      walkLeg(60, 9340),
+    ],
+  });
+
+  assert.strictEqual(
+    context.pickBestItinerary_({ results: [direct, transfer] }, eventStart),
+    transfer,
+  );
+});
+
+test('pickBestItinerary_ only chooses walk-only fallback when walking is faster than transit', () => {
+  const eventStart = new Date(10_000 * 1000);
+  const transit = planResult({
+    duration: 1000,
+    endTime: 9300,
+    legs: [
+      walkLeg(120, 8300),
+      transitLeg(),
+      walkLeg(60, 9240),
+    ],
+  });
+  const slowerWalk = planResult({
+    duration: 1200,
+    endTime: 9400,
+    legs: [
+      walkLeg(1200, 8200),
+    ],
+  });
+  const fasterWalk = planResult({
+    duration: 900,
+    endTime: 9400,
+    legs: [
+      walkLeg(900, 8500),
+    ],
+  });
+
+  assert.strictEqual(
+    context.pickBestItinerary_({ results: [slowerWalk, transit] }, eventStart),
+    transit,
+  );
+  assert.strictEqual(
+    context.pickBestItinerary_({ results: [transit, fasterWalk] }, eventStart),
+    fasterWalk,
+  );
+});
 
 test('extractVehicleRequestsForItinerary_ returns only bus transit legs with route and optional direction', () => {
   const itinerary = {
