@@ -162,7 +162,13 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
         arrival_time: arrival_time_s,
         should_update_realtime: true,
         consider_downtimes: true,
-        max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
+        max_num_departures: 3, // fetch the next departure so we can surface it after the bus leaves
+        num_result: 3,
+        max_num_legs: 3,
+        walk_reluctance: 1.1,
+        walk_speed: 0.89,
+        should_include_directions: true,
+        walk_fallback: true
     };
 
     const url =
