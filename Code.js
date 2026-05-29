@@ -240,7 +240,8 @@ function pickBestItinerary_(plan, eventStart) {
     );
 
     const eventStartTime = Math.floor(eventStart.getTime() / 1000);
-    const secondsUntilEvent = eventStartTime - Math.floor(Date.now() / 1000);
+    const nowInSeconds = Math.floor(Date.now() / 1000);
+    const secondsUntilEvent = eventStartTime - nowInSeconds;
     if (secondsUntilEvent >= 0 && secondsUntilEvent <= NO_TIME_JUMP_WINDOW_SECS) {
         const nonEarlierCandidates = similarCandidates.filter(score =>
             score.result.end_time >= idealTime
