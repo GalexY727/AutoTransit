@@ -4,6 +4,8 @@ const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_M
 const SPLIT_TRANSFER_THRESHOLD_SECS = 15 * 60; // 900 s — transfers at or above this use split events
 const TRANSFER_MIN_SAVINGS_SECS = 5 * 60;
 const SIMILAR_ITINERARY_DURATION_SECS = 5 * 60;
+const NO_TIME_JUMP_WINDOW_SECS = 30 * 60;
+const MAX_OK_EVENT_LATENESS_SECS = 7 * 60;
 const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 
 
@@ -233,9 +235,27 @@ function pickBestItinerary_(plan, eventStart) {
     }
 
     const fastestCandidateDuration = Math.min(...candidates.map(score => score.duration));
-    const similarCandidates = candidates.filter(score =>
+    let similarCandidates = candidates.filter(score =>
         score.duration <= fastestCandidateDuration + SIMILAR_ITINERARY_DURATION_SECS
     );
+
+    const eventStartTime = Math.floor(eventStart.getTime() / 1000);
+    const nowInSeconds = Math.floor(Date.now() / 1000);
+    const secondsUntilEvent = eventStartTime - nowInSeconds;
+    if (secondsUntilEvent >= 0 && secondsUntilEvent <= NO_TIME_JUMP_WINDOW_SECS) {
+        const nonEarlierCandidates = similarCandidates.filter(score =>
+            score.result.end_time >= idealTime
+        );
+        if (nonEarlierCandidates.length) {
+            const earliestNonEarlierArrival = Math.min(
+                ...nonEarlierCandidates.map(score => score.result.end_time)
+            );
+            const nonEarlierLateness = earliestNonEarlierArrival - eventStartTime;
+            if (nonEarlierLateness <= MAX_OK_EVENT_LATENESS_SECS) {
+                similarCandidates = nonEarlierCandidates;
+            }
+        }
+    }
 
     similarCandidates.sort((a, b) =>
         a.arrivalDiff - b.arrivalDiff ||
