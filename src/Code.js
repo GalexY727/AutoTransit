@@ -1,11 +1,22 @@
+const MILLISECONDS_PER_SECOND = 1000;
+const SECONDS_PER_MINUTE = 60;
+const MINUTES_PER_HOUR = 60;
+const HOURS_PER_DAY = 24;
 const NEED_TRANSIT_THRESHOLD_MINS = 90;
+const PLANNER_LOOKAHEAD_DAYS = 1;
+const REALTIME_REFRESH_THRESHOLD_MINS = 25;
+const REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS = 5;
+const TARGET_RECENT_COMMUTE_WINDOW_MINS = 60;
+const DEPARTURE_COUNTDOWN_WINDOW_MINS = 15;
+const COMMUTE_SEARCH_BUFFER_HOURS = 6;
+const TRANSIT_API_RATE_LIMIT_SLEEP_MS = 10000;
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
 const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
-const SPLIT_TRANSFER_THRESHOLD_SECS = 15 * 60; // 900 s — transfers at or above this use split events
-const TRANSFER_MIN_SAVINGS_SECS = 5 * 60;
-const SIMILAR_ITINERARY_DURATION_SECS = 5 * 60;
-const NO_TIME_JUMP_WINDOW_SECS = 30 * 60;
-const MAX_OK_EVENT_LATENESS_SECS = 7 * 60;
+const SPLIT_TRANSFER_THRESHOLD_SECS = minutesToSeconds_(15);
+const TRANSFER_MIN_SAVINGS_SECS = minutesToSeconds_(5);
+const SIMILAR_ITINERARY_DURATION_SECS = minutesToSeconds_(5);
+const NO_TIME_JUMP_WINDOW_SECS = minutesToSeconds_(30);
+const MAX_OK_EVENT_LATENESS_SECS = minutesToSeconds_(7);
 const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 
 
@@ -27,18 +38,14 @@ function runPlanner() {
         throw new Error("Missing TRANSIT_API_KEY or HOME_ADDRESS");
 
     const now = new Date();
-    // NOTE: 18/20 schedule goes only 47 days into the future
-    // So max horizon is now.getTime() + (24 * 60 * 60 * 1000 * 47)
-    const horizon = new Date(now.getTime() + 24 * 60 * 60 * 1000); // next 24h
-    const thresholdStart = new Date(
-        now.getTime() - minsToMs_(NEED_TRANSIT_THRESHOLD_MINS),
-    );
+    // NOTE: 18/20 schedule goes only about 47 days into the future.
+    const eventWindow = createPlannerEventWindow_(now);
 
     // Pull events from threshold to horizon in one call
     const allEvents =
         Calendar.Events.list(sourceCalendar, {
-            timeMin: thresholdStart.toISOString(),
-            timeMax: horizon.toISOString(),
+            timeMin: eventWindow.timeMin.toISOString(),
+            timeMax: eventWindow.timeMax.toISOString(),
             singleEvents: true,
             orderBy: "startTime",
             maxResults: 250,
@@ -71,7 +78,7 @@ function runPlanner() {
         try {
             if (!ev?.start?.dateTime) continue; // skip all-day or malformed events
             const eventStart = new Date(ev.start.dateTime);
-            if (!shouldProcess_(ev, allEvents, targetCalendar, now, eventStart))
+            if (!shouldProcess_(allEvents, targetCalendar, now, eventStart))
                 continue;
             if (!ev.location) continue; // nowhere to route to
             const destLL = geocodeOrThrow_(ev.location);
@@ -89,18 +96,15 @@ function runPlanner() {
             console.log("Skipping event '" + (ev.summary || ev.id) + "': " + e.message);
         } finally {
             // Run this on try or fail
-            Utilities.sleep(10000); // I think transitAPI rate limit is 6 calls per minute -> 10s per call
+            Utilities.sleep(TRANSIT_API_RATE_LIMIT_SLEEP_MS);
         }
     }
 
     logEventChangeSummary_(changeTracker);
 }
 
-function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
-    const realtime_threshold = 25;
-    const thresholdStart = new Date(
-        eventStart.getTime() - minsToMs_(NEED_TRANSIT_THRESHOLD_MINS),
-    );
+function shouldProcess_(allEvents, targetCalendar, now, eventStart) {
+    const thresholdStart = addMinutes_(eventStart, -NEED_TRANSIT_THRESHOLD_MINS);
     const recentEvents = allEvents.filter((e) => {
         if (!e?.start?.dateTime || !e?.end?.dateTime) return false;
         const eStart = new Date(e.start.dateTime);
@@ -116,7 +120,7 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     }
 
     // Entries in targetCalendar (AutoTransit) in the past 60 minutes from event start time
-    const targetThresholdStart = new Date(eventStart.getTime() - minsToMs_(60));
+    const targetThresholdStart = addMinutes_(eventStart, -TARGET_RECENT_COMMUTE_WINDOW_MINS);
     const recentTargetEvents =
         Calendar.Events.list(targetCalendar, {
             timeMin: targetThresholdStart.toISOString(),
@@ -130,11 +134,10 @@ function shouldProcess_(ev, allEvents, targetCalendar, now, eventStart) {
     if (timedRecentTargetEvents.length !== 0) {
         // We have an AutoTransit entry: does it need updating?
         const autoTransitEntry = timedRecentTargetEvents[0];
-        const timeUntilDepart = new Date(autoTransitEntry.start.dateTime).getTime() - now.getTime();
         // Check if event is soon enough for realtime updating -- 'realtime' updating
         // The second clause is to force the event to double check for late arrivals
         // and to reset event name to no longer include relative timestamp in summary
-        if (timeUntilDepart <= minsToMs_(realtime_threshold) && timeUntilDepart > -5) {
+        if (shouldRefreshExistingCommute_(new Date(autoTransitEntry.start.dateTime), now)) {
             return true;
         }
     }
@@ -337,8 +340,8 @@ function getTransferWaits_(transitLegs) {
 function getRelevantBusTimes_(itinerary) {
     // Returns [[depart, arrive], ...] — one pair per transit leg in order
     return getTransitLegs_(itinerary).map(leg => [
-        new Date(leg.start_time * 1000),
-        new Date(leg.end_time * 1000),
+        unixSecondsToDate_(leg.start_time),
+        unixSecondsToDate_(leg.end_time),
     ]);
 }
 
@@ -366,7 +369,7 @@ function getNextDeparture_(itinerary, legIndex) {
     const departures = leg?.departures || [];
     // departures[0] is the planned trip; departures[1] is the following service
     if (departures.length < 2) return null;
-    return new Date(departures[1].departure_time * 1000);
+    return unixSecondsToDate_(departures[1].departure_time);
 }
 
 function extractVehicleRequestsForItinerary_(itinerary) {
@@ -461,7 +464,7 @@ function buildCrowdingLine_(leg, occupancyStatus) {
     if (occupancyStatus === 3) {
         const departures = leg?.departures || [];
         if (departures.length >= 2) {
-            const nextDeparture = new Date(departures[1].departure_time * 1000);
+            const nextDeparture = unixSecondsToDate_(departures[1].departure_time);
             line += ". If skipped, next departure is at " + toRelativeTime_(nextDeparture);
         }
     }
@@ -517,13 +520,13 @@ function buildLegDescriptionBlocks_(busTimes, busStops, transitLegs, parentSumma
 function getRelativeTime_(futureDate) {
     const diffMs = futureDate - new Date();
 
-    const minutes = Math.round(diffMs / 60000);
-    if (minutes < 60) return rtf.format(minutes, 'minute');
+    const minutes = Math.round(diffMs / minutesToMilliseconds_(1));
+    if (minutes < MINUTES_PER_HOUR) return rtf.format(minutes, 'minute');
 
-    const hours = Math.round(diffMs / 3600000);
-    if (hours < 24) return rtf.format(hours, 'hour');
+    const hours = Math.round(diffMs / hoursToMilliseconds_(1));
+    if (hours < HOURS_PER_DAY) return rtf.format(hours, 'hour');
 
-    const days = Math.round(diffMs / 86400000);
+    const days = Math.round(diffMs / daysToMilliseconds_(1));
     return rtf.format(days, 'day');
 }
 
@@ -585,8 +588,8 @@ function parseEventChangeDetailsFromSummary_(summary) {
 }
 
 function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies, changeTracker) {
-    const goTime = new Date(itinerary.start_time * 1000);
-    const arrivalTime = new Date(itinerary.end_time * 1000);
+    const goTime = unixSecondsToDate_(itinerary.start_time);
+    const arrivalTime = unixSecondsToDate_(itinerary.end_time);
     const busNumber = getBusNumber_(itinerary);
     const relevantBusTimes = getRelevantBusTimes_(itinerary);
     const relevantBusStops = getRelevantBusStops_(itinerary);
@@ -595,9 +598,8 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     if (!relevantBusTimes.length) return; // no transit legs found; nothing to upsert
 
     const relativeLeaveTime = getRelativeTime_(goTime);
-    const minsUntilDepart = Math.round((goTime - now) / 60000);
     // Only show the countdown in the title while the departure is upcoming and close
-    const within15Minutes = minsUntilDepart >= 0 && minsUntilDepart < 15;
+    const withinCountdownWindow = shouldShowDepartureCountdown_(goTime, now);
     const busAlreadyLeft = goTime <= now;
     // Surface the next available bus after the planned one has already departed
     const nextDeparture = busAlreadyLeft ? getNextDeparture_(itinerary) : null;
@@ -617,11 +619,13 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     // independent calendar events — one per leg — instead of a combined event.
     if (isSplit) {
         // Use a wide window so both legs' events are found in one query
-        const splitSearchMin = new Date(itinerary.start_time * 1000 - 6 * 60 * 60 * 1000);
-        const splitSearchMax = new Date(itinerary.end_time   * 1000 + 6 * 60 * 60 * 1000);
+        const splitSearchWindow = createCommuteSearchWindow_(
+            unixSecondsToDate_(itinerary.start_time),
+            unixSecondsToDate_(itinerary.end_time),
+        );
         const allExisting = Calendar.Events.list(calId, {
-            timeMin: splitSearchMin.toISOString(),
-            timeMax: splitSearchMax.toISOString(),
+            timeMin: splitSearchWindow.timeMin.toISOString(),
+            timeMax: splitSearchWindow.timeMax.toISOString(),
             q: marker,
             singleEvents: true,
             maxResults: 10,
@@ -634,8 +638,8 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
         // Event 1: start when you leave home → end when you alight from bus 1
         // Event 2: start when you board bus 2 → end when you arrive at class
         const splitBounds = [
-            { calStart: new Date(itinerary.start_time      * 1000), calEnd: new Date(transitLegs[0].end_time   * 1000) },
-            { calStart: new Date(transitLegs[1].start_time * 1000), calEnd: new Date(itinerary.end_time        * 1000) },
+            { calStart: unixSecondsToDate_(itinerary.start_time), calEnd: unixSecondsToDate_(transitLegs[0].end_time) },
+            { calStart: unixSecondsToDate_(transitLegs[1].start_time), calEnd: unixSecondsToDate_(itinerary.end_time) },
         ];
 
         for (let i = 0; i < splitBounds.length; i++) {
@@ -647,10 +651,9 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             const { calStart, calEnd } = splitBounds[i];
 
             // Use each leg's own boarding time for the countdown and busAlreadyLeft check
-            const legGoTime = new Date(leg.start_time * 1000);
-            const legMinsUntilDepart = Math.round((legGoTime - now) / 60000);
+            const legGoTime = unixSecondsToDate_(leg.start_time);
             // Only show the countdown in the title while the departure is upcoming and close
-            const legWithin15    = legMinsUntilDepart >= 0 && legMinsUntilDepart < 15;
+            const legWithinCountdownWindow = shouldShowDepartureCountdown_(legGoTime, now);
             const legAlreadyLeft = legGoTime <= now;
             const legRelativeTime = getRelativeTime_(legGoTime);
             // Check next departure for this specific leg
@@ -662,7 +665,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             const toTarget = isLastLeg
                 ? (parentEv.summary || '(untitled)')
                 : (legStops?.[1] || parentEv.summary || '(untitled)');
-            const legSummary = `🚍 ${legBusNum} ${ legWithin15 ? legRelativeTime + ' ' : '' }to: ${toTarget}`;
+            const legSummary = `🚍 ${legBusNum} ${ legWithinCountdownWindow ? legRelativeTime + ' ' : '' }to: ${toTarget}`;
 
             // After departure: "Bus left at 10:30 AM. Next departure is at 10:50 AM"
             // Before departure: "Bus leaves in 5 minutes at 10:30 AM"
@@ -725,20 +728,19 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     // ── END SPLIT PATH ───────────────────────────────────────────────────────
 
     // Find existing commute event in a small window
-    const searchMin = new Date(goTime.getTime() - 6 * 60 * 60 * 1000);
-    const searchMax = new Date(arrivalTime.getTime() + 6 * 60 * 60 * 1000);
+    const searchWindow = createCommuteSearchWindow_(goTime, arrivalTime);
 
     const existing =
         Calendar.Events.list(calId, {
-            timeMin: searchMin.toISOString(),
-            timeMax: searchMax.toISOString(),
+            timeMin: searchWindow.timeMin.toISOString(),
+            timeMax: searchWindow.timeMax.toISOString(),
             q: marker,
             singleEvents: true,
             maxResults: 10,
         }).items || [];
     const timedExisting = sortTimedEventsByStart_(existing);
 
-    const summary = `🚍 ${busNumber || "Bus"} ${ within15Minutes ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
+    const summary = `🚍 ${busNumber || "Bus"} ${ withinCountdownWindow ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
 
     // After departure: "Bus left at 10:30 AM. Next departure is at 10:50 AM"
     // Before departure: "Bus leaves in 5 minutes at 10:30 AM"
@@ -887,8 +889,66 @@ function toQuery_(obj) {
         .join("&");
 }
 
-function minsToMs_(mins) {
-    return mins * 60 * 1000;
+function createPlannerEventWindow_(now) {
+    return {
+        timeMin: addMinutes_(now, -NEED_TRANSIT_THRESHOLD_MINS),
+        timeMax: addDays_(now, PLANNER_LOOKAHEAD_DAYS),
+    };
+}
+
+function createCommuteSearchWindow_(startTime, endTime) {
+    return {
+        timeMin: addHours_(startTime, -COMMUTE_SEARCH_BUFFER_HOURS),
+        timeMax: addHours_(endTime, COMMUTE_SEARCH_BUFFER_HOURS),
+    };
+}
+
+function shouldShowDepartureCountdown_(departureTime, now) {
+    const msUntilDeparture = departureTime.getTime() - now.getTime();
+    return (
+        msUntilDeparture >= 0 &&
+        msUntilDeparture < minutesToMilliseconds_(DEPARTURE_COUNTDOWN_WINDOW_MINS)
+    );
+}
+
+function shouldRefreshExistingCommute_(departureTime, now) {
+    const msUntilDeparture = departureTime.getTime() - now.getTime();
+    return (
+        msUntilDeparture <= minutesToMilliseconds_(REALTIME_REFRESH_THRESHOLD_MINS) &&
+        msUntilDeparture > -minutesToMilliseconds_(REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS)
+    );
+}
+
+function addMinutes_(date, minutes) {
+    return new Date(date.getTime() + minutesToMilliseconds_(minutes));
+}
+
+function addHours_(date, hours) {
+    return new Date(date.getTime() + hoursToMilliseconds_(hours));
+}
+
+function addDays_(date, days) {
+    return new Date(date.getTime() + daysToMilliseconds_(days));
+}
+
+function unixSecondsToDate_(seconds) {
+    return new Date(seconds * MILLISECONDS_PER_SECOND);
+}
+
+function minutesToSeconds_(minutes) {
+    return minutes * SECONDS_PER_MINUTE;
+}
+
+function minutesToMilliseconds_(minutes) {
+    return minutesToSeconds_(minutes) * MILLISECONDS_PER_SECOND;
+}
+
+function hoursToMilliseconds_(hours) {
+    return minutesToMilliseconds_(hours * MINUTES_PER_HOUR);
+}
+
+function daysToMilliseconds_(days) {
+    return hoursToMilliseconds_(days * HOURS_PER_DAY);
 }
 
 function dedent_(strings, ...values) {
