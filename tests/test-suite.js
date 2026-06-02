@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const vm = require('vm');
 
-const source = fs.readFileSync('Code.js', 'utf8');
+const source = fs.readFileSync('src/Code.js', 'utf8');
 const context = {
   console,
   Intl,
@@ -265,6 +265,44 @@ test('recordEventChange_ logs each change and increments the tracker', () => {
     'Made 19 to Science Hill on Jan 3, 2026',
     'Deleted 20 to Old commute on Jan 4, 2026',
   ]));
+});
+
+test('createPlannerEventWindow_ returns the source calendar scrape window around now', () => {
+  const now = new Date(2026, 0, 1, 8, 0);
+  const window = context.createPlannerEventWindow_(now);
+
+  assert.strictEqual(window.timeMin.toISOString(), new Date(2026, 0, 1, 6, 30).toISOString());
+  assert.strictEqual(window.timeMax.toISOString(), new Date(2026, 0, 2, 8, 0).toISOString());
+});
+
+test('createCommuteSearchWindow_ uses the same buffer before and after commute times', () => {
+  const start = new Date(2026, 0, 1, 7, 30);
+  const end = new Date(2026, 0, 1, 8, 45);
+  const window = context.createCommuteSearchWindow_(start, end);
+
+  assert.strictEqual(window.timeMin.toISOString(), new Date(2026, 0, 1, 1, 30).toISOString());
+  assert.strictEqual(window.timeMax.toISOString(), new Date(2026, 0, 1, 14, 45).toISOString());
+});
+
+test('shouldShowDepartureCountdown_ only shows upcoming departures within countdown window', () => {
+  const now = new Date(2026, 0, 1, 8, 0);
+
+  assert.strictEqual(context.shouldShowDepartureCountdown_(new Date(2026, 0, 1, 8, 14), now), true);
+  assert.strictEqual(context.shouldShowDepartureCountdown_(new Date(2026, 0, 1, 8, 15), now), false);
+  assert.strictEqual(context.shouldShowDepartureCountdown_(new Date(2026, 0, 1, 7, 59), now), false);
+});
+
+test('shouldRefreshExistingCommute_ refreshes near departures with a five minute grace period', () => {
+  const now = new Date(2026, 0, 1, 8, 0);
+
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 8, 25), now), true);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 8, 26), now), false);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 7, 56), now), true);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 7, 54), now), false);
+});
+
+test('minutesToMilliseconds_ converts minute units consistently', () => {
+  assert.strictEqual(context.minutesToMilliseconds_(90), 5_400_000);
 });
 
 function createChangeTracker_(lines) {
