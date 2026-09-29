@@ -6,11 +6,11 @@ const NEED_TRANSIT_THRESHOLD_MINS = 90;
 const PLANNER_LOOKAHEAD_DAYS = 1;
 const REALTIME_REFRESH_THRESHOLD_MINS = 25;
 const REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS = 5;
-const TARGET_RECENT_COMMUTE_WINDOW_MINS = 60;
 const DEPARTURE_COUNTDOWN_WINDOW_MINS = 15;
 const COMMUTE_SEARCH_BUFFER_HOURS = 6;
 const TRANSIT_API_RATE_LIMIT_SLEEP_MS = 10 * 1000; // I think transitAPI rate limit is 6 calls per minute -> 10s per call
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
+const WALK_SPEED_MPS = 0.89;
 const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
 const SPLIT_TRANSFER_THRESHOLD_SECS = minutesToSeconds_(15);
 const TRANSFER_MIN_SAVINGS_SECS = minutesToSeconds_(5);
@@ -21,6 +21,19 @@ const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
 
 
 function runPlanner() {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(1000)) {
+        console.log("Planner already running; skipping overlapping invocation.");
+        return;
+    }
+    try {
+        runPlannerUnlocked_();
+    } finally {
+        lock.releaseLock();
+    }
+}
+
+function runPlannerUnlocked_() {
     const props = PropertiesService.getScriptProperties();
     const apiKey = props.getProperty("TRANSIT_API_KEY");
     const homeAddress = props.getProperty("HOME_ADDRESS");
@@ -78,7 +91,7 @@ function runPlanner() {
         try {
             if (!ev?.start?.dateTime) continue; // skip all-day or malformed events
             const eventStart = new Date(ev.start.dateTime);
-            if (!shouldProcess_(allEvents, targetCalendar, now, eventStart))
+            if (!shouldProcess_(allEvents, targetCalendar, now, ev))
                 continue;
             if (!ev.location) continue; // nowhere to route to
             const destLL = geocodeOrThrow_(ev.location);
@@ -103,7 +116,8 @@ function runPlanner() {
     logEventChangeSummary_(changeTracker);
 }
 
-function shouldProcess_(allEvents, targetCalendar, now, eventStart) {
+function shouldProcess_(allEvents, targetCalendar, now, parentEv) {
+    const eventStart = new Date(parentEv.start.dateTime);
     const thresholdStart = addMinutes_(eventStart, -NEED_TRANSIT_THRESHOLD_MINS);
     const recentEvents = allEvents.filter((e) => {
         if (!e?.start?.dateTime || !e?.end?.dateTime) return false;
@@ -119,32 +133,19 @@ function shouldProcess_(allEvents, targetCalendar, now, eventStart) {
         return false; // Skip if there are recent events -- already on campus
     }
 
-    // Entries in targetCalendar (AutoTransit) in the past 60 minutes from event start time
-    const targetThresholdStart = addMinutes_(eventStart, -TARGET_RECENT_COMMUTE_WINDOW_MINS);
-    const recentTargetEvents =
-        Calendar.Events.list(targetCalendar, {
-            timeMin: targetThresholdStart.toISOString(),
-            timeMax: eventStart.toISOString(),
-            singleEvents: true,
-            maxResults: 250,
-        }).items || [];
-
-    const timedRecentTargetEvents = sortTimedEventsByStart_(recentTargetEvents);
+    // Match only commute events for this source event.
+    const timedRecentTargetEvents = findCommuteEvents_(targetCalendar, parentEv);
 
     if (timedRecentTargetEvents.length !== 0) {
-        // We have an AutoTransit entry: does it need updating?
-        const autoTransitEntry = timedRecentTargetEvents[0];
-        // Check if event is soon enough for realtime updating -- 'realtime' updating
-        // The second clause is to force the event to double check for late arrivals
-        // and to reset event name to no longer include relative timestamp in summary
-        if (shouldRefreshExistingCommute_(new Date(autoTransitEntry.start.dateTime), now)) {
+        // Refresh when any matching leg is near departure, including split trips.
+        if (timedRecentTargetEvents.some(entry =>
+            shouldRefreshExistingCommute_(new Date(entry.start.dateTime), now)
+        )) {
             return true;
         }
     }
 
-    // Check if there is NOT an entry in targetCalendar (AutoTransit) in the past 60 minutes
-    // * from the event start time
-    return timedRecentTargetEvents.length === 0; // Process if no recent timed target events
+    return timedRecentTargetEvents.length === 0;
 }
 
 // Uses Apps Script Maps service geocoder
@@ -172,9 +173,9 @@ function transitPlanArriveBy_(apiKey, fromLL, toLL, arriveByDate) {
         max_num_departures: 2, // fetch the next departure so we can surface it after the bus leaves
         num_result: 3,
         max_num_legs: 5,
-        walk_reluctance: 1.1,
-        walk_speed: 0.89,
-        should_include_directions: false,
+        walk_reluctance: 2.1,
+        walk_speed: WALK_SPEED_MPS,
+        should_include_directions: true,
         walk_fallback: true
     };
 
@@ -223,9 +224,10 @@ function pickBestItinerary_(plan, eventStart) {
 
     if (transitScores.length) {
         const fastestTransitDuration = Math.min(...transitScores.map(score => score.duration));
-        candidates = candidates.filter(score =>
-            score.transitLegCount > 0 || score.duration < fastestTransitDuration
+        const fasterWalks = candidates.filter(score =>
+            score.transitLegCount === 0 && score.duration < fastestTransitDuration
         );
+        candidates = fasterWalks.length ? fasterWalks : transitScores;
     }
 
     const directTransitScores = transitScores.filter(score => score.transitLegCount === 1);
@@ -261,8 +263,8 @@ function pickBestItinerary_(plan, eventStart) {
     }
 
     similarCandidates.sort((a, b) =>
-        a.arrivalDiff - b.arrivalDiff ||
         a.walkSeconds - b.walkSeconds ||
+        a.arrivalDiff - b.arrivalDiff ||
         a.transferCount - b.transferCount ||
         a.duration - b.duration ||
         a.index - b.index
@@ -486,6 +488,64 @@ function sortTimedEventsByStart_(events) {
         .sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
 }
 
+function parentMarkerFromEvent_(parentEv) {
+    return COMMUTE_TAG_PREFIX + parentEv.id;
+}
+
+function hasParentMarker_(event, marker) {
+    return (event.description || '').split(/\r?\n/).some(line => line.trim() === marker);
+}
+
+function findCommuteEvents_(calId, parentEv) {
+    const eventStart = new Date(parentEv.start.dateTime);
+    const marker = parentMarkerFromEvent_(parentEv);
+    const matches = [];
+    let pageToken;
+    do {
+        const params = {
+            timeMin: addHours_(eventStart, -24).toISOString(),
+            timeMax: addHours_(eventStart, 1).toISOString(),
+            singleEvents: true,
+            maxResults: 250,
+        };
+        if (pageToken) params.pageToken = pageToken;
+        const page = Calendar.Events.list(calId, params);
+        matches.push(...(page.items || []).filter(event =>
+            event?.start?.dateTime && hasParentMarker_(event, marker)
+        ));
+        pageToken = page.nextPageToken;
+    } while (pageToken);
+    return sortTimedEventsByStart_(matches);
+}
+
+function getWalkingLines_(itinerary, parentEv, busStops, onlyTransitIndex) {
+    const legs = itinerary?.legs || [];
+    const lines = [];
+    let transitIndex = 0;
+    for (let i = 0; i < legs.length; i++) {
+        const leg = legs[i];
+        if (leg?.leg_mode === 'transit') {
+            transitIndex++;
+            continue;
+        }
+        if (leg?.leg_mode !== 'walk') continue;
+        const nextTransitIndex = transitIndex < busStops.length ? transitIndex : null;
+        const ownerIndex = nextTransitIndex ?? transitIndex - 1;
+        if (onlyTransitIndex != null && ownerIndex !== onlyTransitIndex) continue;
+        const destination = nextTransitIndex == null
+            ? (formatLocation_(parentEv.location) || parentEv.summary || 'destination')
+            : formatStopName_(busStops[nextTransitIndex]?.[0], parentEv.summary);
+        const seconds = typeof leg.duration === 'number'
+            ? leg.duration : Math.max(0, leg.end_time - leg.start_time);
+        const minutes = Math.max(1, Math.round(seconds / SECONDS_PER_MINUTE));
+        lines.push(`Walk to ${destination}: about ${minutes} min`);
+        for (const step of leg.directions || []) {
+            if (step?.instruction) lines.push(`  ${step.instruction}`);
+        }
+    }
+    return lines.join('\n');
+}
+
 function isFutureTimedEvent_(event, now) {
     return !!event?.start?.dateTime && new Date(event.start.dateTime) > now;
 }
@@ -579,7 +639,7 @@ function parseEventChangeDetailsFromSummary_(summary) {
     if (!match) return fallback;
 
     const busNumber = match[1]
-        .replace(/\s+(?:this minute|in \d+ minutes?)$/, "")
+        .replace(/\s+(?:go )?(?:this minute|in \d+ minutes?)$/, "")
         .trim();
     return {
         busNumber: busNumber || "Bus",
@@ -600,7 +660,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     const relativeLeaveTime = getRelativeTime_(goTime);
     // Only show the countdown in the title while the departure is upcoming and close
     const withinCountdownWindow = shouldShowDepartureCountdown_(goTime, now);
-    const busAlreadyLeft = goTime <= now;
+    const busAlreadyLeft = relevantBusTimes[0][0] <= now;
     // Surface the next available bus after the planned one has already departed
     const nextDeparture = busAlreadyLeft ? getNextDeparture_(itinerary) : null;
 
@@ -613,24 +673,13 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
 
     const parentId = parentEv.id;
     const marker = COMMUTE_TAG_PREFIX + parentId;
+    const allExisting = findCommuteEvents_(calId, parentEv);
+    const walkingLines = getWalkingLines_(itinerary, parentEv, relevantBusStops);
 
     // ── SPLIT PATH ──────────────────────────────────────────────────────────
     // When exactly 2 transit legs have a transfer of 15+ min, create two
     // independent calendar events — one per leg — instead of a combined event.
     if (isSplit) {
-        // Use a wide window so both legs' events are found in one query
-        const splitSearchWindow = createCommuteSearchWindow_(
-            unixSecondsToDate_(itinerary.start_time),
-            unixSecondsToDate_(itinerary.end_time),
-        );
-        const allExisting = Calendar.Events.list(calId, {
-            timeMin: splitSearchWindow.timeMin.toISOString(),
-            timeMax: splitSearchWindow.timeMax.toISOString(),
-            q: marker,
-            singleEvents: true,
-            maxResults: 10,
-        }).items || [];
-
         // Sort ascending so hits[0] → leg 1 event, hits[1] → leg 2 event.
         // Ignore all-day marker matches; split commute events are always timed.
         const timedExisting = sortTimedEventsByStart_(allExisting);
@@ -654,7 +703,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             const legGoTime = unixSecondsToDate_(leg.start_time);
             // Only show the countdown in the title while the departure is upcoming and close
             const legWithinCountdownWindow = shouldShowDepartureCountdown_(legGoTime, now);
-            const legAlreadyLeft = legGoTime <= now;
+            const legAlreadyLeft = legTimes[0] <= now;
             const legRelativeTime = getRelativeTime_(legGoTime);
             // Check next departure for this specific leg
             const legNextDepart = legAlreadyLeft ? getNextDeparture_(itinerary, i) : null;
@@ -665,14 +714,15 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
             const toTarget = isLastLeg
                 ? (parentEv.summary || '(untitled)')
                 : (legStops?.[1] || parentEv.summary || '(untitled)');
-            const legSummary = `🚍 ${legBusNum} ${ legWithinCountdownWindow ? legRelativeTime + ' ' : '' }to: ${toTarget}`;
+            const legSummary = `🚍 ${legBusNum} ${ legWithinCountdownWindow ? 'go ' + legRelativeTime + ' ' : '' }to: ${toTarget}`;
 
             // After departure: "Bus left at 10:30 AM. Next departure is at 10:50 AM"
             // Before departure: "Bus leaves in 5 minutes at 10:30 AM"
             const legStatusLine = legAlreadyLeft
                 ? `Bus left at ${ toRelativeTime_(legTimes[0]) }` +
                   (legNextDepart ? `. Next departure is at ${ toRelativeTime_(legNextDepart) }` : '')
-                : `Bus leaves ${ legRelativeTime } at ${ toRelativeTime_(legTimes[0]) }`;
+                : `Go at ${toRelativeTime_(legGoTime)}. Bus leaves at ${toRelativeTime_(legTimes[0])}`;
+            const legWalkingLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, i);
 
             const legBody = {
                 summary: legSummary,
@@ -682,6 +732,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                      ➟ Last updated at ${ toRelativeTime_(now) }
 
                     ${formatOptionalDescriptionLine_(crowdingLine)}
+                    ${formatOptionalDescriptionLine_(legWalkingLines)}
                     Get on at:   ${ formatStopName_(legStops?.[0], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[0]) }
                     Get off at:   ${ formatStopName_(legStops?.[1], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[1]) }
 
@@ -727,27 +778,16 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     }
     // ── END SPLIT PATH ───────────────────────────────────────────────────────
 
-    // Find existing commute event in a small window
-    const searchWindow = createCommuteSearchWindow_(goTime, arrivalTime);
+    const timedExisting = allExisting;
 
-    const existing =
-        Calendar.Events.list(calId, {
-            timeMin: searchWindow.timeMin.toISOString(),
-            timeMax: searchWindow.timeMax.toISOString(),
-            q: marker,
-            singleEvents: true,
-            maxResults: 10,
-        }).items || [];
-    const timedExisting = sortTimedEventsByStart_(existing);
-
-    const summary = `🚍 ${busNumber || "Bus"} ${ withinCountdownWindow ? relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
+    const summary = `🚍 ${busNumber || "Bus"} ${ withinCountdownWindow ? "go " + relativeLeaveTime + " " : "" }to: ${parentEv.summary || "(untitled)"}`;
 
     // After departure: "Bus left at 10:30 AM. Next departure is at 10:50 AM"
     // Before departure: "Bus leaves in 5 minutes at 10:30 AM"
     const busStatusLine = busAlreadyLeft
         ? `Bus left at ${ toRelativeTime_(relevantBusTimes[0][0]) }` +
           (nextDeparture ? `. Next departure is at ${ toRelativeTime_(nextDeparture) }` : "")
-        : `Bus leaves ${ relativeLeaveTime } at ${ toRelativeTime_(relevantBusTimes[0][0]) }`;
+        : `Go at ${toRelativeTime_(goTime)}. Bus leaves at ${toRelativeTime_(relevantBusTimes[0][0])}`;
     const crowdingLine = buildCrowdingLine_(transitLegs[0], vehicleOccupancies?.[0]);
 
     const body = {
@@ -758,6 +798,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
+                ${formatOptionalDescriptionLine_(walkingLines)}
                 ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, parentEv.summary, vehicleOccupancies) }
 
                 Auto-generated by AutoTransit for:
@@ -770,6 +811,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
                 ${formatOptionalDescriptionLine_(crowdingLine)}
+                ${formatOptionalDescriptionLine_(walkingLines)}
                 Get on at:   ${ formatStopName_(relevantBusStops[0]?.[0], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][0]) }
                 Get off at:   ${ formatStopName_(relevantBusStops[0]?.[1], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][1])}
 
@@ -815,7 +857,7 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
 function cleanCommuteSummaryCountdown_(summary) {
     if (!summary) return summary;
     return summary.replace(
-        /^((?::oncoming_bus:|🚍)\s+.+?)\s+(?:this minute|in \d+ minutes?)\s+(to:\s+)/,
+        /^((?::oncoming_bus:|🚍)\s+.+?)\s+(?:go )?(?:this minute|in \d+ minutes?)\s+(to:\s+)/,
         "$1 $2",
     );
 }
@@ -881,6 +923,69 @@ function cleanupPastCommuteEventTitlesBatch_(calId, options) {
         (result.nextPageToken ? " Run cleanupPastCommuteEventTitles() again for the next page." : ""),
     );
     return { updated, nextPageToken: result.nextPageToken || null, stoppedEarly: false };
+}
+
+function cleanupPastDuplicateCommuteEvents() {
+    const props = PropertiesService.getScriptProperties();
+    const calId = props.getProperty("TARGET_CALENDAR_ID") || "AutoTransit";
+    const deleted = cleanupPastDuplicateCommuteEventsBatch_(calId);
+    console.log(`Deleted ${deleted} duplicate commute events.`);
+}
+
+function cleanupPastDuplicateCommuteEventsBatch_(calId, options) {
+    options = options || {};
+    const now = options.now || new Date();
+    const maxDeletes = options.maxDeletes ?? 50;
+    const groups = new Map();
+    let pageToken;
+    do {
+        const params = {
+            timeMin: (options.timeMin || new Date(2000, 0, 1)).toISOString(),
+            timeMax: now.toISOString(),
+            singleEvents: true,
+            maxResults: 250,
+        };
+        if (pageToken) params.pageToken = pageToken;
+        const page = Calendar.Events.list(calId, params);
+        for (const event of page.items || []) {
+            if (!event?.start?.dateTime || !event?.end?.dateTime) continue;
+            if (new Date(event.end.dateTime) >= now) continue;
+            const marker = (event.description || '').split(/\r?\n/)
+                .map(line => line.trim())
+                .find(line => line.startsWith(COMMUTE_TAG_PREFIX));
+            if (!marker) continue;
+            if (!groups.has(marker)) groups.set(marker, []);
+            groups.get(marker).push(event);
+        }
+        pageToken = page.nextPageToken;
+    } while (pageToken);
+
+    let deleted = 0;
+    for (const events of groups.values()) {
+        if (events.length < 2) continue;
+        events.sort((a, b) => new Date(b.created || b.updated || 0) - new Date(a.created || a.updated || 0));
+        const keep = [events[0]];
+        for (const event of events.slice(1)) {
+            if (keep.length === 1 && isDistinctSplitLeg_(keep[0], event)) {
+                keep.push(event);
+                continue;
+            }
+            Calendar.Events.remove(calId, event.id);
+            deleted++;
+            if (deleted >= maxDeletes) return deleted;
+        }
+    }
+    return deleted;
+}
+
+function isDistinctSplitLeg_(a, b) {
+    const aStart = new Date(a.start.dateTime).getTime();
+    const aEnd = new Date(a.end.dateTime).getTime();
+    const bStart = new Date(b.start.dateTime).getTime();
+    const bEnd = new Date(b.end.dateTime).getTime();
+    const nonOverlapping = aEnd <= bStart || bEnd <= aStart;
+    const boardingStop = event => event.description?.match(/^Get on at:\s*(.*?)\s+@/m)?.[1];
+    return nonOverlapping && !!boardingStop(a) && !!boardingStop(b) && boardingStop(a) !== boardingStop(b);
 }
 
 function toQuery_(obj) {

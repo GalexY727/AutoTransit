@@ -167,6 +167,38 @@ test('pickBestItinerary_ only chooses walk-only fallback when walking is faster 
   );
 });
 
+test('pickBestItinerary_ favors less walking among similarly fast bus trips', () => {
+  const eventStart = new Date(10_000 * 1000);
+  const longWalk = planResult({ duration: 1800, endTime: 9400, legs: [walkLeg(900, 7600), transitLeg()] });
+  const shortWalk = planResult({ duration: 1900, endTime: 9300, legs: [walkLeg(180, 7400), transitLeg()] });
+  assert.strictEqual(context.pickBestItinerary_({ results: [longWalk, shortWalk] }, eventStart), shortWalk);
+});
+
+test('transitPlanArriveBy_ requests minimized walking and directions at the configured pace', () => {
+  let requestedUrl;
+  context.UrlFetchApp = { fetch: url => {
+    requestedUrl = url;
+    return { getResponseCode: () => 200, getContentText: () => '{"results":[]}' };
+  } };
+  context.transitPlanArriveBy_('key', { lat: 1, lon: 2 }, { lat: 3, lon: 4 }, new Date(10_000 * 1000));
+  const query = new URL(requestedUrl).searchParams;
+  assert.strictEqual(query.get('walk_reluctance'), '2.1');
+  assert.strictEqual(query.get('walk_speed'), '0.89');
+  assert.strictEqual(query.get('should_include_directions'), 'true');
+});
+
+test('getWalkingLines_ names the boarding stop and destination with API walk times', () => {
+  const itinerary = { legs: [
+    { ...walkLeg(330), directions: [{ instruction: 'Head toward Bay Street' }] },
+    transitLeg(),
+    walkLeg(120),
+  ] };
+  const description = context.getWalkingLines_(itinerary, { summary: 'Class', location: 'Science Hill, Santa Cruz' }, [['Bay and High', 'Campus']]);
+  assert.ok(description.includes('Walk to Bay and High: about 6 min'));
+  assert.ok(description.includes('Head toward Bay Street'));
+  assert.ok(description.includes('Walk to Science Hill, Santa Cruz: about 2 min'));
+});
+
 test('extractVehicleRequestsForItinerary_ returns only bus transit legs with route and optional direction', () => {
   const itinerary = {
     legs: [
@@ -224,6 +256,32 @@ test('cleanCommuteSummaryCountdown_ removes this minute and in n minute countdow
     context.cleanCommuteSummaryCountdown_('Foo Bar in 1 minute to: leave'),
     'Foo Bar in 1 minute to: leave',
   );
+  assert.strictEqual(context.cleanCommuteSummaryCountdown_('🚍 18 go in 5 minutes to: Class'), '🚍 18 to: Class');
+});
+
+test('findCommuteEvents_ matches the exact parent ID across pages without text search', () => {
+  const parent = { id: 'class-1', start: { dateTime: new Date(2026, 0, 1, 13).toISOString() } };
+  const calls = [];
+  context.Calendar = { Events: { list: (_calId, params) => {
+    calls.push(params);
+    return params.pageToken ? { items: [{ id: 'match', start: { dateTime: new Date(2026, 0, 1, 12).toISOString() }, description: 'auto_commute_parent=class-1' }] }
+      : { nextPageToken: 'next', items: [{ id: 'wrong', start: { dateTime: new Date(2026, 0, 1, 12).toISOString() }, description: 'auto_commute_parent=class-10' }] };
+  } } };
+  const events = context.findCommuteEvents_('AutoTransit', parent);
+  assert.strictEqual(JSON.stringify(events.map(event => event.id)), JSON.stringify(['match']));
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].q, undefined);
+});
+
+test('shouldProcess_ ignores nearby commute events belonging to a different source event', () => {
+  const now = new Date(2026, 0, 1, 8);
+  const parent = { id: 'class-1', start: { dateTime: new Date(2026, 0, 1, 10).toISOString() } };
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'other-commute',
+    start: { dateTime: new Date(2026, 0, 1, 9).toISOString() },
+    description: 'auto_commute_parent=class-2',
+  }] }) } };
+  assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), true);
 });
 
 test('formatEventChangeLogLine_ describes event writes with route, destination, and date', () => {
@@ -406,4 +464,54 @@ test('cleanupPastCommuteEventTitles stores next page token for follow-up runs', 
   assert.strictEqual(JSON.stringify(calls), JSON.stringify([
     { calId: 'AutoTransit', pageToken: 'old-token' },
   ]));
+});
+
+test('upsertCommuteEvent_ updates an existing parent commute instead of inserting', () => {
+  const start = Math.floor(new Date(2026, 0, 1, 8).getTime() / 1000);
+  const leg = transitLeg();
+  leg.start_time = start + 300;
+  leg.end_time = start + 1200;
+  const itinerary = { start_time: start, end_time: start + 1500, legs: [
+    walkLeg(300, start), leg, walkLeg(300, start + 1200),
+  ] };
+  const parent = { id: 'class-1', summary: 'Class', location: 'Science Hill, Santa Cruz', start: { dateTime: new Date((start + 3600) * 1000).toISOString() } };
+  const patched = [];
+  const inserted = [];
+  context.Calendar = { Events: {
+    list: () => ({ items: [{ id: 'commute-1', start: { dateTime: new Date(start * 1000).toISOString() }, description: 'auto_commute_parent=class-1' }] }),
+    patch: (body, _calId, id) => patched.push({ body, id }),
+    insert: body => inserted.push(body),
+  } };
+  context.upsertCommuteEvent_('AutoTransit', parent, itinerary, new Date((start - 1800) * 1000), {}, createChangeTracker_([]));
+  assert.strictEqual(patched.length, 1);
+  assert.strictEqual(patched[0].id, 'commute-1');
+  assert.strictEqual(inserted.length, 0);
+  assert.ok(patched[0].body.description.includes('Go at'));
+  assert.ok(patched[0].body.description.includes('Bus leaves at'));
+  assert.ok(patched[0].body.description.includes('Walk to Bay and High'));
+});
+
+test('cleanupPastDuplicateCommuteEventsBatch_ keeps latest duplicate and valid split legs', () => {
+  const day = new Date(2026, 0, 1, 8).getTime();
+  const event = (id, parent, startOffset, endOffset, createdOffset, stop) => ({
+    id,
+    created: new Date(day + createdOffset).toISOString(),
+    start: { dateTime: new Date(day + startOffset).toISOString() },
+    end: { dateTime: new Date(day + endOffset).toISOString() },
+    description: `Get on at: ${stop} @ 8:00 AM\nauto_commute_parent=${parent}`,
+  });
+  const events = [
+    event('old', 'one', 0, 1800000, 0, 'Bay'),
+    event('new', 'one', 60000, 1860000, 1000, 'Bay'),
+    event('split-first', 'two', 0, 600000, 0, 'Bay'),
+    event('split-second', 'two', 1200000, 1800000, 1000, 'Campus'),
+  ];
+  const removed = [];
+  context.Calendar = { Events: {
+    list: () => ({ items: events }),
+    remove: (_calId, id) => removed.push(id),
+  } };
+  const deleted = context.cleanupPastDuplicateCommuteEventsBatch_('AutoTransit', { now: new Date(day + 7200000) });
+  assert.strictEqual(deleted, 1);
+  assert.strictEqual(JSON.stringify(removed), JSON.stringify(['old']));
 });
