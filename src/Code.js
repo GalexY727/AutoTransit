@@ -4,7 +4,8 @@ const MINUTES_PER_HOUR = 60;
 const HOURS_PER_DAY = 24;
 const NEED_TRANSIT_THRESHOLD_MINS = 90;
 const PLANNER_LOOKAHEAD_DAYS = 1;
-const REALTIME_REFRESH_THRESHOLD_MINS = 25;
+const TARGET_RECENT_COMMUTE_WINDOW_MINS = 60;
+const REALTIME_REFRESH_THRESHOLD_MINS = TARGET_RECENT_COMMUTE_WINDOW_MINS;
 const REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS = 5;
 const DEPARTURE_COUNTDOWN_WINDOW_MINS = 15;
 const COMMUTE_SEARCH_BUFFER_HOURS = 6;
@@ -139,7 +140,7 @@ function shouldProcess_(allEvents, targetCalendar, now, parentEv) {
     if (timedRecentTargetEvents.length !== 0) {
         // Refresh when any matching leg is near departure, including split trips.
         if (timedRecentTargetEvents.some(entry =>
-            shouldRefreshExistingCommute_(new Date(entry.start.dateTime), now)
+            shouldRefreshExistingCommute_(entry, now)
         )) {
             return true;
         }
@@ -1016,12 +1017,31 @@ function shouldShowDepartureCountdown_(departureTime, now) {
     );
 }
 
-function shouldRefreshExistingCommute_(departureTime, now) {
+function shouldRefreshExistingCommute_(target, now) {
+    if (target && typeof target === "object" && target.start && target.start.dateTime) {
+        if (hasCommuteFinalUpdate_(target)) return false;
+        const startTime = new Date(target.start.dateTime);
+        const endTime = new Date(target.end?.dateTime || startTime);
+        const msUntilStart = startTime.getTime() - now.getTime();
+        if (msUntilStart > minutesToMilliseconds_(TARGET_RECENT_COMMUTE_WINDOW_MINS)) {
+            return false;
+        }
+        return (
+            now.getTime() <=
+            endTime.getTime() +
+                minutesToMilliseconds_(REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS)
+        );
+    }
+    const departureTime = target instanceof Date ? target : new Date(target);
     const msUntilDeparture = departureTime.getTime() - now.getTime();
     return (
-        msUntilDeparture <= minutesToMilliseconds_(REALTIME_REFRESH_THRESHOLD_MINS) &&
+        msUntilDeparture <= minutesToMilliseconds_(TARGET_RECENT_COMMUTE_WINDOW_MINS) &&
         msUntilDeparture > -minutesToMilliseconds_(REALTIME_REFRESH_GRACE_AFTER_DEPARTURE_MINS)
     );
+}
+
+function hasCommuteFinalUpdate_(event) {
+    return /Bus left at /i.test(event?.description || "");
 }
 
 function addMinutes_(date, minutes) {

@@ -284,6 +284,38 @@ test('shouldProcess_ ignores nearby commute events belonging to a different sour
   assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), true);
 });
 
+test('shouldProcess_ waits when commute is > 60m away, refreshes within 60m, and stops after final update', () => {
+  const now = new Date(2026, 0, 1, 8, 0);
+  const parent = { id: 'class-1', start: { dateTime: new Date(2026, 0, 1, 10, 0).toISOString() } };
+
+  // Case 1: commute event is > 60m away (e.g. starts at 9:30 AM) -> wait (false)
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-1',
+    start: { dateTime: new Date(2026, 0, 1, 9, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 9, 55).toISOString() },
+    description: 'Go at 9:30 AM. Bus leaves at 9:40 AM\nauto_commute_parent=class-1',
+  }] }) } };
+  assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), false);
+
+  // Case 2: commute event is within 60m (e.g. starts at 8:45 AM) -> refresh (true)
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-1',
+    start: { dateTime: new Date(2026, 0, 1, 8, 45).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 9, 10).toISOString() },
+    description: 'Go at 8:45 AM. Bus leaves at 8:55 AM\nauto_commute_parent=class-1',
+  }] }) } };
+  assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), true);
+
+  // Case 3: commute event has final update (Bus left at ...) -> do not refresh again (false)
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-1',
+    start: { dateTime: new Date(2026, 0, 1, 7, 50).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 8, 15).toISOString() },
+    description: 'Bus left at 8:00 AM. Next departure is at 8:20 AM\nauto_commute_parent=class-1',
+  }] }) } };
+  assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), false);
+});
+
 test('formatEventChangeLogLine_ describes event writes with route, destination, and date', () => {
   const date = new Date(2026, 0, 2, 8, 30);
 
@@ -350,13 +382,48 @@ test('shouldShowDepartureCountdown_ only shows upcoming departures within countd
   assert.strictEqual(context.shouldShowDepartureCountdown_(new Date(2026, 0, 1, 7, 59), now), false);
 });
 
-test('shouldRefreshExistingCommute_ refreshes near departures with a five minute grace period', () => {
+test('shouldRefreshExistingCommute_ refreshes within 60 minute window with a five minute grace period', () => {
   const now = new Date(2026, 0, 1, 8, 0);
 
-  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 8, 25), now), true);
-  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 8, 26), now), false);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 9, 0), now), true);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 9, 1), now), false);
   assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 7, 56), now), true);
   assert.strictEqual(context.shouldRefreshExistingCommute_(new Date(2026, 0, 1, 7, 54), now), false);
+});
+
+test('shouldRefreshExistingCommute_ refreshes event objects within window and stops after final update', () => {
+  const now = new Date(2026, 0, 1, 8, 0);
+  const futureEvent = {
+    start: { dateTime: new Date(2026, 0, 1, 9, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 10, 0).toISOString() },
+    description: 'Go at 9:30 AM. Bus leaves at 9:40 AM',
+  };
+  const upcomingEvent = {
+    start: { dateTime: new Date(2026, 0, 1, 8, 45).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 9, 15).toISOString() },
+    description: 'Go at 8:45 AM. Bus leaves at 8:55 AM',
+  };
+  const ongoingEvent = {
+    start: { dateTime: new Date(2026, 0, 1, 7, 50).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 8, 20).toISOString() },
+    description: 'Go at 7:50 AM. Bus leaves at 8:05 AM',
+  };
+  const completedFinalUpdateEvent = {
+    start: { dateTime: new Date(2026, 0, 1, 7, 50).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 8, 20).toISOString() },
+    description: 'Bus left at 8:05 AM. Next departure is at 8:25 AM',
+  };
+  const passedEvent = {
+    start: { dateTime: new Date(2026, 0, 1, 7, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 7, 40).toISOString() },
+    description: 'Go at 7:10 AM. Bus leaves at 7:20 AM',
+  };
+
+  assert.strictEqual(context.shouldRefreshExistingCommute_(futureEvent, now), false);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(upcomingEvent, now), true);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(ongoingEvent, now), true);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(completedFinalUpdateEvent, now), false);
+  assert.strictEqual(context.shouldRefreshExistingCommute_(passedEvent, now), false);
 });
 
 test('minutesToMilliseconds_ converts minute units consistently', () => {
