@@ -6,9 +6,9 @@ It uses your home address, event locations, the Google Calendar advanced service
 
 ## Features
 
-- **Automatic commute events**: creates or updates calendar entries for upcoming events that need transit from home.
+- **Automatic commute events**: creates or updates calendar entries for upcoming events that need transit from home, matched by source event ID.
 - **Transit API v4 planning**: plans trips with real-time updates, downtime handling, and an extra departure for next-bus guidance.
-- **Multi-leg route support**: combines normal transfers into one commute event and lists each leg with route, stop, and transfer wait details.
+- **Multi-leg route support**: combines normal transfers into one commute event and lists each leg with route, stop, walking, and transfer wait details.
 - **Split transfer support**: if a two-leg trip has a transfer of 15 minutes or more, AutoTransit creates separate calendar events for each leg.
 - **Crowding levels**: adds crowding status for bus legs when vehicle occupancy data is available.
 - **Late-bus context**: after a planned bus leaves, descriptions can show the next departure when the API provides one.
@@ -23,7 +23,7 @@ It uses your home address, event locations, the Google Calendar advanced service
 3. It skips events that do not need a commute, such as all-day events, events without locations, and events soon after another source event.
 4. It geocodes your home address and the event location.
 5. It requests a Transit API plan that arrives before the event.
-6. It picks the itinerary closest to arriving 10 minutes early.
+6. It favors less walking among similarly fast itineraries, then picks the arrival closest to 10 minutes early.
 7. It fetches crowding data for bus legs when route IDs are available.
 8. It creates, updates, or deletes target-calendar commute events as needed.
 9. It logs each calendar change and a final change count.
@@ -95,6 +95,17 @@ You normally do not need to set or edit the internal properties.
 
    A time-driven trigger is usually the safest option. Calendar-change triggers can work, but be careful with recursion because AutoTransit writes calendar events too.
 
+### Automatic deployment
+
+The GitHub Actions workflow runs tests and pushes the script to Apps Script after each push to `main`. It then runs `runPlanner`. Add these repository Actions secrets before using it:
+
+| Secret | Value |
+| --- | --- |
+| `CLASPRC_JSON` | Contents of the clasp login file (`~/.clasprc.json`) from the account authorized for the Apps Script project. |
+| `CLASP_JSON` | Contents of this project's `.clasp.json`, including its `scriptId`. |
+
+The workflow can also be started manually with **Actions > Deploy Apps Script > Run workflow**. The Apps Script project must already have its script properties and Calendar advanced service configured. No secrets are stored in the repository.
+
 ## Local Development
 
 Run the test suite:
@@ -106,7 +117,7 @@ npm test
 Check JavaScript syntax:
 
 ```bash
-node --check Code.js
+node --check src/Code.js
 ```
 
 Useful npm scripts:
@@ -130,6 +141,10 @@ Updated 19 to Science Hill on Jan 3, 2026
 Deleted 20 to Old commute on Jan 4, 2026
 AutoTransit made 3 changes.
 ```
+
+### `cleanupPastDuplicateCommuteEvents()`
+
+Run this function manually once in Apps Script to remove duplicate past commute events. It keeps the most recently created event for each source event and preserves distinct, nonoverlapping legs of a split trip. It removes at most 50 events per run; run it again if the log reports 50 deletions.
 
 ## Notes
 
