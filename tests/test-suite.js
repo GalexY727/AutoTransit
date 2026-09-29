@@ -189,14 +189,64 @@ test('transitPlanArriveBy_ requests minimized walking and directions at the conf
 
 test('getWalkingLines_ names the boarding stop and destination with API walk times', () => {
   const itinerary = { legs: [
-    { ...walkLeg(330), directions: [{ instruction: 'Head toward Bay Street' }] },
+    { ...walkLeg(330), directions: [
+      { instruction: 'Head toward Bay Street' },
+      { instruction: 'Turn left onto Street A' },
+      { instruction: 'Turn right on Street B' },
+    ] },
     transitLeg(),
-    walkLeg(120),
+    { ...walkLeg(120), directions: [{ instruction: 'Turn left onto High St' }] },
   ] };
   const description = context.getWalkingLines_(itinerary, { summary: 'Class', location: 'Science Hill, Santa Cruz' }, [['Bay and High', 'Campus']]);
   assert.ok(description.includes('Walk to Bay and High: about 6 min'));
-  assert.ok(description.includes('Head toward Bay Street'));
+  assert.ok(description.includes('left at Street A, then right at Street B'));
+  assert.ok(!description.includes('Head toward Bay Street'));
   assert.ok(description.includes('Walk to Science Hill, Santa Cruz: about 2 min'));
+  assert.ok(!description.includes('left at High St'));
+});
+
+test('getWalkingLines_ filters by position and formats concise turns', () => {
+  const itinerary = { legs: [
+    { ...walkLeg(360), directions: [
+      { instruction: 'Turn left onto Street A' },
+      { instruction: 'Turn right on Street B' },
+    ] },
+    transitLeg(),
+    { ...walkLeg(420), directions: [
+      { instruction: 'Slight left onto Steinhart Way' },
+    ] },
+  ] };
+  const stops = [['Bay and High', 'Science Hill']];
+  const parent = { summary: 'Class', location: 'Science Hill, Santa Cruz' };
+
+  const before = context.getWalkingLines_(itinerary, parent, stops, null, 'before');
+  const after = context.getWalkingLines_(itinerary, parent, stops, null, 'after');
+
+  assert.ok(before.includes('Walk to Bay and High: about 6 min'));
+  assert.ok(before.includes('left at Street A, then right at Street B'));
+  assert.ok(!before.includes('Science Hill'));
+
+  assert.ok(after.includes('Walk to Science Hill, Santa Cruz: about 7 min'));
+  assert.ok(after.includes('slight left at Steinhart Way'));
+  assert.ok(!after.includes('Bay and High'));
+});
+
+test('extractMajorTurn_ and formatMajorTurns_ parse turns and combine concisely', () => {
+  assert.strictEqual(context.extractMajorTurn_('Turn left onto Bay St'), 'left at Bay St');
+  assert.strictEqual(context.extractMajorTurn_('Turn right on High St.'), 'right at High St');
+  assert.strictEqual(context.extractMajorTurn_('Slight right on Hagar Dr'), 'slight right at Hagar Dr');
+  assert.strictEqual(context.extractMajorTurn_('Head north on Bay St'), null);
+  assert.strictEqual(context.extractMajorTurn_('Continue onto High St'), null);
+
+  assert.strictEqual(context.formatMajorTurns_(['left at Street A']), 'left at Street A');
+  assert.strictEqual(
+    context.formatMajorTurns_(['left at Street A', 'right at Street B']),
+    'left at Street A, then right at Street B',
+  );
+  assert.strictEqual(
+    context.formatMajorTurns_(['left at Street A', 'right at Street B', 'left at Street C']),
+    'left at Street A, right at Street B, then left at Street C',
+  );
 });
 
 test('extractVehicleRequestsForItinerary_ returns only bus transit legs with route and optional direction', () => {
@@ -556,6 +606,10 @@ test('upsertCommuteEvent_ updates an existing parent commute instead of insertin
   assert.ok(patched[0].body.description.includes('Go at'));
   assert.ok(patched[0].body.description.includes('Bus leaves at'));
   assert.ok(patched[0].body.description.includes('Walk to Bay and High'));
+  assert.ok(patched[0].body.description.includes('Walk to Science Hill'));
+  const desc = patched[0].body.description;
+  assert.ok(desc.indexOf('Walk to Bay and High') < desc.indexOf('Get on at:'));
+  assert.ok(desc.indexOf('Get off at:') < desc.indexOf('Walk to Science Hill'));
 });
 
 test('cleanupPastDuplicateCommuteEventsBatch_ keeps latest duplicate and valid split legs', () => {

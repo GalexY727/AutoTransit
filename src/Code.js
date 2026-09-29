@@ -12,6 +12,7 @@ const COMMUTE_SEARCH_BUFFER_HOURS = 6;
 const TRANSIT_API_RATE_LIMIT_SLEEP_MS = 10 * 1000; // I think transitAPI rate limit is 6 calls per minute -> 10s per call
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
 const WALK_SPEED_MPS = 0.89;
+const WALK_DETAILS_THRESHOLD_MINS = 5;
 const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
 const SPLIT_TRANSFER_THRESHOLD_SECS = minutesToSeconds_(15);
 const TRANSFER_MIN_SAVINGS_SECS = minutesToSeconds_(5);
@@ -519,32 +520,83 @@ function findCommuteEvents_(calId, parentEv) {
     return sortTimedEventsByStart_(matches);
 }
 
-function getWalkingLines_(itinerary, parentEv, busStops, onlyTransitIndex) {
+function extractMajorTurn_(step) {
+    const text = typeof step === "string" ? step : step?.instruction || "";
+    if (!text) return null;
+    const trimmed = text.trim();
+
+    if (/\b(?:then|and then)\b/i.test(trimmed)) {
+        return trimmed;
+    }
+
+    const match = trimmed.match(
+        /^(?:turn\s+|make\s+a\s+|take\s+a\s+|bear\s+|keep\s+)?(left|right|slight\s+left|slight\s+right|sharp\s+left|sharp\s+right|u-turn)(?:\s+(?:onto|on|at|into|toward|towards)\s+(.+?))?$/i,
+    );
+    if (!match) return null;
+
+    const action = match[1].toLowerCase().replace(/\s+/g, " ");
+    const street = (match[2] || step?.way_name || "")
+        .trim()
+        .replace(/[.,;]+$/, "");
+
+    return street ? `${action} at ${street}` : action;
+}
+
+function formatMajorTurns_(turns) {
+    if (!turns || turns.length === 0) return "";
+    if (turns.length === 1) return turns[0];
+    if (turns.length === 2) return `${turns[0]}, then ${turns[1]}`;
+    return `${turns.slice(0, -1).join(", ")}, then ${turns[turns.length - 1]}`;
+}
+
+function getWalkingLines_(itinerary, parentEv, busStops, onlyTransitIndex, positionFilter) {
     const legs = itinerary?.legs || [];
     const lines = [];
     let transitIndex = 0;
     for (let i = 0; i < legs.length; i++) {
         const leg = legs[i];
-        if (leg?.leg_mode === 'transit') {
+        if (leg?.leg_mode === "transit") {
             transitIndex++;
             continue;
         }
-        if (leg?.leg_mode !== 'walk') continue;
+        if (leg?.leg_mode !== "walk") continue;
         const nextTransitIndex = transitIndex < busStops.length ? transitIndex : null;
         const ownerIndex = nextTransitIndex ?? transitIndex - 1;
         if (onlyTransitIndex != null && ownerIndex !== onlyTransitIndex) continue;
+
+        const isInitial = transitIndex === 0;
+        const isFinal = nextTransitIndex == null;
+        if (positionFilter === "before") {
+            const matchesBefore = onlyTransitIndex != null ? (nextTransitIndex != null) : isInitial;
+            if (!matchesBefore) continue;
+        } else if (positionFilter === "after") {
+            const matchesAfter = onlyTransitIndex != null ? (nextTransitIndex == null) : isFinal;
+            if (!matchesAfter) continue;
+        }
+
         const destination = nextTransitIndex == null
-            ? (formatLocation_(parentEv.location) || parentEv.summary || 'destination')
+            ? (formatLocation_(parentEv.location) || parentEv.summary || "destination")
             : formatStopName_(busStops[nextTransitIndex]?.[0], parentEv.summary);
-        const seconds = typeof leg.duration === 'number'
+        const seconds = typeof leg.duration === "number"
             ? leg.duration : Math.max(0, leg.end_time - leg.start_time);
         const minutes = Math.max(1, Math.round(seconds / SECONDS_PER_MINUTE));
         lines.push(`Walk to ${destination}: about ${minutes} min`);
-        for (const step of leg.directions || []) {
-            if (step?.instruction) lines.push(`  ${step.instruction}`);
+
+        if (minutes > WALK_DETAILS_THRESHOLD_MINS) {
+            const turns = [];
+            for (const step of leg.directions || []) {
+                const turn = extractMajorTurn_(step);
+                if (turn && turn !== turns[turns.length - 1]) {
+                    turns.push(turn);
+                }
+            }
+            const turnsText = formatMajorTurns_(turns);
+            if (turnsText) {
+                lines.push(`  ${turnsText}`);
+            }
         }
     }
-    return lines.join('\n');
+    return lines.join("\n");
 }
 
 function isFutureTimedEvent_(event, now) {
@@ -675,7 +727,8 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
     const parentId = parentEv.id;
     const marker = COMMUTE_TAG_PREFIX + parentId;
     const allExisting = findCommuteEvents_(calId, parentEv);
-    const walkingLines = getWalkingLines_(itinerary, parentEv, relevantBusStops);
+    const initialWalkLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, null, "before");
+    const finalWalkLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, null, "after");
 
     // ── SPLIT PATH ──────────────────────────────────────────────────────────
     // When exactly 2 transit legs have a transfer of 15+ min, create two
@@ -723,7 +776,8 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                 ? `Bus left at ${ toRelativeTime_(legTimes[0]) }` +
                   (legNextDepart ? `. Next departure is at ${ toRelativeTime_(legNextDepart) }` : '')
                 : `Go at ${toRelativeTime_(legGoTime)}. Bus leaves at ${toRelativeTime_(legTimes[0])}`;
-            const legWalkingLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, i);
+            const legInitialWalkLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, i, "before");
+            const legFinalWalkLines = getWalkingLines_(itinerary, parentEv, relevantBusStops, i, "after");
 
             const legBody = {
                 summary: legSummary,
@@ -733,9 +787,10 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                      ➟ Last updated at ${ toRelativeTime_(now) }
 
                     ${formatOptionalDescriptionLine_(crowdingLine)}
-                    ${formatOptionalDescriptionLine_(legWalkingLines)}
+                    ${formatOptionalDescriptionLine_(legInitialWalkLines)}
                     Get on at:   ${ formatStopName_(legStops?.[0], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[0]) }
                     Get off at:   ${ formatStopName_(legStops?.[1], parentEv.summary) + ' @ ' + toRelativeTime_(legTimes[1]) }
+                    ${formatOptionalDescriptionLine_(legFinalWalkLines)}
 
                     Auto-generated by AutoTransit for:
                     ${parentEv.summary || 'Event Name'} @ ${formatLocation_(parentEv.location) || 'Location'}
@@ -799,8 +854,9 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                 ${ busStatusLine }
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
-                ${formatOptionalDescriptionLine_(walkingLines)}
+                ${formatOptionalDescriptionLine_(initialWalkLines)}
                 ${ buildLegDescriptionBlocks_(relevantBusTimes, relevantBusStops, transitLegs, parentEv.summary, vehicleOccupancies) }
+                ${formatOptionalDescriptionLine_(finalWalkLines)}
 
                 Auto-generated by AutoTransit for:
                 ${parentEv.summary || "Event Name"} @ ${formatLocation_(parentEv.location) || "Location"}
@@ -812,9 +868,10 @@ function upsertCommuteEvent_(calId, parentEv, itinerary, now, vehicleOccupancies
                  ➟ Last updated at ${ toRelativeTime_(now) }
 
                 ${formatOptionalDescriptionLine_(crowdingLine)}
-                ${formatOptionalDescriptionLine_(walkingLines)}
+                ${formatOptionalDescriptionLine_(initialWalkLines)}
                 Get on at:   ${ formatStopName_(relevantBusStops[0]?.[0], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][0]) }
                 Get off at:   ${ formatStopName_(relevantBusStops[0]?.[1], parentEv.summary) + " @ " + toRelativeTime_(relevantBusTimes[0][1])}
+                ${formatOptionalDescriptionLine_(finalWalkLines)}
 
                 Auto-generated by AutoTransit for:
                 ${parentEv.summary || "Event Name"} @ ${formatLocation_(parentEv.location) || "Location"}
