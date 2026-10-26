@@ -415,6 +415,29 @@ test('shouldProcess_ refreshes forced event when commute exists and departure is
   assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), true);
 });
 
+test('shouldProcess_ does not reprocess forced event after final update', () => {
+  const now = new Date(2026, 0, 1, 11, 10);
+  const prior = {
+    id: 'prior-event',
+    start: { dateTime: new Date(2026, 0, 1, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+  };
+  const current = {
+    id: 'current-event',
+    start: { dateTime: new Date(2026, 0, 1, 11, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 12, 30).toISOString() },
+    description: 'FS Auto Weekly !t',
+  };
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-existing',
+    start: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11, 25).toISOString() },
+    description: 'Bus left at 11:05 AM. Next departure is at 11:25 AM\nauto_commute_parent=current-event',
+  }] }) } };
+
+  assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), false);
+});
+
 test('formatEventChangeLogLine_ describes event writes with route, destination, and date', () => {
   const date = new Date(2026, 0, 2, 8, 30);
 
