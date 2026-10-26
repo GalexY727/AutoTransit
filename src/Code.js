@@ -11,6 +11,7 @@ const DEPARTURE_COUNTDOWN_WINDOW_MINS = 15;
 const COMMUTE_SEARCH_BUFFER_HOURS = 6;
 const TRANSIT_API_RATE_LIMIT_SLEEP_MS = 10 * 1000; // I think transitAPI rate limit is 6 calls per minute -> 10s per call
 const COMMUTE_TAG_PREFIX = "auto_commute_parent=";
+const FORCE_TRANSIT_FLAG = "!t";
 const WALK_SPEED_MPS = 0.89;
 const CLEANUP_PAGE_TOKEN_PROP = "CLEANUP_PAST_COMMUTE_TITLES_PAGE_TOKEN_DO_NOT_MANUALLY_MODIFY";
 const SPLIT_TRANSFER_THRESHOLD_SECS = minutesToSeconds_(15);
@@ -130,7 +131,7 @@ function shouldProcess_(allEvents, targetCalendar, now, parentEv) {
     });
 
     // Check if there are events on sourceCalendar in the past need_transit_threshold_minutes
-    if (recentEvents.length > 0) {
+    if (!hasForceTransitFlag_(parentEv) && recentEvents.length > 0) {
         return false; // Skip if there are recent events -- already on campus
     }
 
@@ -495,6 +496,11 @@ function parentMarkerFromEvent_(parentEv) {
 
 function hasParentMarker_(event, marker) {
     return (event.description || '').split(/\r?\n/).some(line => line.trim() === marker);
+}
+
+function hasForceTransitFlag_(event) {
+    const description = typeof event === 'string' ? event : event?.description;
+    return /(?:^|\W)!t(?:\W|$)/i.test(description || '');
 }
 
 function findCommuteEvents_(calId, parentEv) {

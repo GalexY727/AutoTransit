@@ -316,6 +316,105 @@ test('shouldProcess_ waits when commute is > 60m away, refreshes within 60m, and
   assert.strictEqual(context.shouldProcess_([parent], 'AutoTransit', now, parent), false);
 });
 
+test('hasForceTransitFlag_ detects !t flag across formats and avoids false positives', () => {
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '!t' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '!T' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: 'FS Auto Weekly !t' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '!t FS Auto Weekly' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: 'Weekly meeting\n!t\nBring laptop' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: 'Meeting (!t)' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '<p>!t</p>' }), true);
+  assert.strictEqual(context.hasForceTransitFlag_('!t'), true);
+
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '' }), false);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: null }), false);
+  assert.strictEqual(context.hasForceTransitFlag_({}), false);
+  assert.strictEqual(context.hasForceTransitFlag_(null), false);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '!today meeting' }), false);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: '!test' }), false);
+  assert.strictEqual(context.hasForceTransitFlag_({ description: "don't!touch" }), false);
+});
+
+test('shouldProcess_ skips events within a class cluster without !t flag', () => {
+  const now = new Date(2026, 0, 1, 8);
+  const prior = {
+    id: 'prior-event',
+    start: { dateTime: new Date(2026, 0, 1, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+  };
+  const current = {
+    id: 'current-event',
+    start: { dateTime: new Date(2026, 0, 1, 11, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 12, 30).toISOString() },
+    description: 'FS Auto Weekly',
+  };
+  context.Calendar = { Events: { list: () => ({ items: [] }) } };
+
+  assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), false);
+});
+
+test('shouldProcess_ computes events within a class cluster when !t is detected', () => {
+  const now = new Date(2026, 0, 1, 8);
+  const prior = {
+    id: 'prior-event',
+    start: { dateTime: new Date(2026, 0, 1, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+  };
+  const current = {
+    id: 'current-event',
+    start: { dateTime: new Date(2026, 0, 1, 11, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 12, 30).toISOString() },
+    description: 'FS Auto Weekly !t',
+  };
+  context.Calendar = { Events: { list: () => ({ items: [] }) } };
+
+  assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), true);
+});
+
+test('shouldProcess_ does not reprocess forced event when commute exists and departure is not near', () => {
+  const now = new Date(2026, 0, 1, 8);
+  const prior = {
+    id: 'prior-event',
+    start: { dateTime: new Date(2026, 0, 1, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+  };
+  const current = {
+    id: 'current-event',
+    start: { dateTime: new Date(2026, 0, 1, 11, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 12, 30).toISOString() },
+    description: 'FS Auto Weekly !t',
+  };
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-existing',
+    start: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+    description: 'auto_commute_parent=current-event',
+  }] }) } };
+
+  assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), false);
+});
+
+test('shouldProcess_ refreshes forced event when commute exists and departure is near', () => {
+  const now = new Date(2026, 0, 1, 10, 45);
+  const prior = {
+    id: 'prior-event',
+    start: { dateTime: new Date(2026, 0, 1, 10).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+  };
+  const current = {
+    id: 'current-event',
+    start: { dateTime: new Date(2026, 0, 1, 11, 30).toISOString() },
+    end: { dateTime: new Date(2026, 0, 1, 12, 30).toISOString() },
+    description: 'FS Auto Weekly !t',
+  };
+  context.Calendar = { Events: { list: () => ({ items: [{
+    id: 'commute-existing',
+    start: { dateTime: new Date(2026, 0, 1, 11).toISOString() },
+    description: 'auto_commute_parent=current-event',
+  }] }) } };
+
+  assert.strictEqual(context.shouldProcess_([prior, current], 'AutoTransit', now, current), true);
+});
+
 test('formatEventChangeLogLine_ describes event writes with route, destination, and date', () => {
   const date = new Date(2026, 0, 2, 8, 30);
 
