@@ -12,6 +12,7 @@ It uses your home address, event locations, the Google Calendar advanced service
 - **Split transfer support**: if a two-leg trip has a transfer of 15 minutes or more, AutoTransit creates separate calendar events for each leg.
 - **Crowding levels**: adds crowding status for bus legs when vehicle occupancy data is available.
 - **Late-bus context**: after a planned bus leaves, descriptions can show the next departure when the API provides one.
+- **Forced transit flag**: adding `!t` to an event description forces transit planning even if the event is within an on-campus cluster soon after another event.
 - **Safer event filtering**: skips all-day and malformed events, ignores non-timed commute matches, and avoids unnecessary API calls.
 - **Run summaries**: logs each created, updated, or deleted event, then logs the total number of changes made by `runPlanner()`.
 - **Local test suite**: Node-based tests cover the pure helpers and cleanup behavior. Not pushed to clasp.
@@ -20,7 +21,7 @@ It uses your home address, event locations, the Google Calendar advanced service
 
 1. `runPlanner()` reads script properties for your API key, home address, source calendar, and target calendar.
 2. It scans upcoming source-calendar events within the planning window.
-3. It skips events that do not need a commute, such as all-day events, events without locations, and events soon after another source event.
+3. It skips events that do not need a commute, such as all-day events, events without locations, and events soon after another source event (unless forced with `!t` in the description).
 4. It geocodes your home address and the event location.
 5. It requests a Transit API plan that arrives before the event.
 6. It favors less walking among similarly fast itineraries, then picks the arrival closest to 10 minutes early.
